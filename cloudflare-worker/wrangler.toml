@@ -1,0 +1,57 @@
+# Cloudflare Worker Configuration
+# This file is used by Wrangler CLI to deploy the worker
+#
+# DYNAMIC ROUTING: The Worker automatically handles both staging and production
+# by using the deploymentUrl from the API response. No need to change config!
+#
+# Deploy: wrangler deploy
+
+account_id = "23a7a421ed33ef027eebdea27215f0c7"
+name = "domain-router"
+main = "domain-router.js"
+compatibility_date = "2024-01-01"
+
+# Routes configured via Cloudflare Dashboard (not wrangler.toml)
+# Dashboard routes take precedence and work with Cloudflare for SaaS
+routes = [
+  { pattern = "*/*", zone_name = "shipper.now" },
+  { pattern = "*shipper.now/*", zone_name = "shipper.now" },
+  { pattern = "shipper.now/*", zone_name = "shipper.now" }
+]
+
+# Disable workers.dev subdomain since we use custom routes
+workers_dev = false
+
+# Environment variables (use wrangler secret for sensitive values)
+[vars]
+# API_BASE_URL points to the backend that knows about all projects (staging + production)
+# The backend returns the correct deploymentUrl for each project
+API_BASE_URL = "https://shipper-api-staging.up.railway.app"
+
+# DEBUG mode - set to "true" to enable verbose logging (disable in production)
+DEBUG = "false"
+
+# To set the API key securely:
+# wrangler secret put API_KEY
+# Then enter your API key when prompted
+
+# ============================================
+# HOW CLOUDFLARE FOR SAAS ROUTING WORKS
+# ============================================
+# 
+# 1. User visits custom domain: oinkbot.xyz
+# 2. Custom hostname uses fallback origin: cname.shipper.now
+# 3. Cloudflare routes to fallback origin (your zone)
+# 4. Dashboard Worker Route (*/*) catches ALL traffic
+# 5. Worker reads Host header to get custom domain
+# 6. Worker looks up project and proxies to deployment URL
+# 
+# CRITICAL SETUP REQUIREMENTS:
+# 1. Custom hostnames must NOT use custom_origin_server
+# 2. Worker routes must be added via Dashboard (not wrangler.toml)
+# 3. Dashboard route pattern: */* (catches everything)
+# 
+# WHY DASHBOARD ROUTES ARE REQUIRED:
+# - wrangler.toml routes don't intercept Cloudflare for SaaS traffic
+# - Dashboard routes work at the zone level for all incoming requests
+# - This is a Cloudflare for SaaS limitation/requirement

@@ -1,0 +1,28 @@
+{
+  "name": "@shipper/database",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "prisma generate && node scripts/generate-exports.js",
+    "postinstall": "prisma generate && node scripts/generate-exports.js",
+    "db:generate": "phase run --path /database prisma generate && node scripts/generate-exports.js",
+    "db:migrate": "phase run --path /database prisma migrate dev --skip-generate",
+    "db:migrate:local": "phase run --path /database prisma migrate deploy",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:deploy": "prisma migrate deploy",
+    "db:push": "phase run --path /database prisma db push",
+    "db:studio": "phase run --path /database prisma studio"
+  },
+  "dependencies": {
+    "@prisma/client": "6.17.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.1",
+    "prisma": "6.17.1",
+    "typescript": "^5.9.2"
+  }
+}

@@ -1,0 +1,17 @@
+# This is a config for E2B sandbox template.
+# You can use template ID (im4m2ev66fxsqi0uffr9) or template name (shipper-vite-13) to create a sandbox:
+
+# Python SDK
+# from e2b import Sandbox, AsyncSandbox
+# sandbox = Sandbox("shipper-vite-13") # Sync sandbox
+# sandbox = await AsyncSandbox.create("shipper-vite-13") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'e2b'
+# const sandbox = await Sandbox.create('shipper-vite-13')
+
+team_id = "54476918-f9c7-48c1-9976-8cac6ca71e41"
+start_cmd = "/compile_page.sh"
+dockerfile = "e2b.Dockerfile"
+template_name = "shipper-vite-13"
+template_id = "im4m2ev66fxsqi0uffr9"
