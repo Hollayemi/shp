@@ -1,0 +1,1433 @@
+generator client {
+  provider      = "prisma-client-js"
+  output        = "../generated/prisma"
+  moduleFormat  = "esm"
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                     String         @id @default(cuid())
+  name                   String?
+  email                  String         @unique
+  emailVerified          DateTime?
+  image                  String?
+  role                   UserRole       @default(USER)
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+  password               String?
+  isNewUser              Boolean        @default(true)
+  activeProjectId        String?
+  activeSandboxId        String?
+  sandboxCreatedAt       DateTime?
+  sandboxLastUsedAt      DateTime?
+  activeFragmentId       String?
+  creditBalance          Int            @default(0)
+  lastCreditReset        DateTime?
+  lifetimeCreditsUsed    Int            @default(0)
+  membershipExpiresAt    DateTime?
+  membershipTier         MembershipTier @default(FREE)
+  monthlyCreditsUsed     Int            @default(0)
+  stripeCurrentPeriodEnd DateTime?
+  stripeCustomerId       String?        @unique
+  stripePriceId          String?
+  stripeSubscriptionId   String?        @unique
+  daytonaActiveSandboxId String?
+  githubAccessToken      String?
+  githubRefreshToken     String?
+  githubUsername         String?
+  githubEmail            String?
+  githubAvatarUrl        String?
+  basePlanCredits        Int            @default(0)
+  carryOverCredits       Int            @default(0)
+  carryOverExpiresAt     DateTime?
+
+  // Shipper Cloud Credits (separate from Builder credits)
+  // 1 credit = 1 cent ($0.01), used for deployed app usage (DB, storage, AI, etc.)
+  cloudCreditBalance        Int     @default(0)
+  cloudLifetimeCreditsUsed  Int     @default(0)
+  cloudFirstDeploymentBonus Boolean @default(false) // Has user received $1 bonus?
+
+  activeSandboxBuilds     Int                      @default(0)
+  buildRateLimitResetAt   DateTime?
+  buildsThisHour          Int                      @default(0)
+  lastBuildStartedAt      DateTime?
+  maxConcurrentBuilds     Int                      @default(1)
+  creditPurchases         CreditPurchase[]
+  creditTransactions      CreditTransaction[]
+  cloudCreditPurchases    CloudCreditPurchase[]
+  cloudCreditTransactions CloudCreditTransaction[]
+  projects                Project[]
+  subscriptions           Subscription[]
+  accounts                Account[]
+  autoFixSessions         AutoFixSession[]
+  createdTemplates        CommunityTemplate[]
+  deployments             Deployment[]
+  halChatMessages         HalChatMessage[]
+  halInteractions         HalInteraction[]
+  halPreferences          HalUserPreferences?
+  sessions                Session[]
+  teamMemberships         TeamMember[]
+  templateComments        TemplateComment[]
+  templateLikes           TemplateLike[]
+  templatePurchases       TemplatePurchase[]
+  templateRemixes         TemplateRemix[]
+  templateSaves           TemplateSave[]
+  uploads                 Upload[]
+  autoTopUpConfig         AutoTopUpConfig?
+  stripeCreditGrants      StripeCreditGrant[]
+  codeImports             CodeImport[]
+  personalConnectors      PersonalConnector[]
+  createdSharedConnectors SharedConnector[]        @relation("SharedConnectorCreator")
+
+  @@index([membershipTier])
+  @@index([stripeCustomerId])
+  @@index([membershipExpiresAt])
+  @@map("users")
+}
+
+model Subscription {
+  id                      String             @id @default(cuid())
+  userId                  String
+  stripeSubscriptionId    String             @unique
+  stripePriceId           String
+  stripeCurrentPeriodEnd  DateTime
+  stripeCancelAtPeriodEnd Boolean            @default(false)
+  status                  SubscriptionStatus
+  createdAt               DateTime           @default(now())
+  updatedAt               DateTime           @updatedAt
+  user                    User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Account {
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@id([identifier, token])
+  @@map("verificationtokens")
+}
+
+model Message {
+  id        String      @id @default(uuid())
+  content   String
+  role      MessageRole
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+  type      MessageType
+  projectId String?
+  fragment  Fragment?
+  project   Project?    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model Fragment {
+  id         String   @id @default(uuid())
+  messageId  String   @unique
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  sandboxUrl String
+  title      String
+  files      Json
+  message    Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+}
+
+model V2Fragment {
+  id        String   @id @default(uuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  title     String
+  files     Json
+
+  // Modal snapshot support - captures complete filesystem state
+  snapshotImageId   String? // Modal Image ID from snapshotFilesystem()
+  snapshotCreatedAt DateTime? // When the snapshot was created
+  snapshotProvider  String? // "modal" or "daytona" for future extensibility
+
+  projectId          String
+  project            Project                 @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectErrors      ProjectError[] // Errors detected in this fragment
+  componentEdits     ComponentEditMetadata[] // Component-level edit metadata for undo/redo
+  communityTemplates CommunityTemplate[] // Templates created from this fragment
+
+  @@index([projectId])
+  @@index([createdAt(sort: Desc)])
+  @@index([snapshotImageId])
+}
+
+// Component-level edit metadata for visual editing undo/redo
+model ComponentEditMetadata {
+  id        String   @id @default(uuid())
+  createdAt DateTime @default(now())
+
+  // Link to the fragment that was created by this edit
+  fragmentId String
+  fragment   V2Fragment @relation(fields: [fragmentId], references: [id], onDelete: Cascade)
+
+  // Component identification
+  filePath      String // e.g., "src/App.tsx"
+  shipperId     String? // e.g., "App.tsx:42:4" from Vite plugin
+  selector      String // CSS selector
+  componentName String? // Component name or tag
+
+  // For repeated components
+  isRepeated     Boolean @default(false)
+  instanceIndex  Int? // Which instance was edited (0-based)
+  totalInstances Int? // Total number of instances
+
+  // Change information
+  changeType String // "style" | "text" | "combined"
+
+  // Store the component code before and after
+  beforeSnapshot String @db.Text // Component code before edit
+  afterSnapshot  String @db.Text // Component code after edit
+
+  // Store the actual changes for reference
+  styleChanges Json? // Record<string, string> of style changes
+  textChanges  String? @db.Text // New text content if changed
+
+  // Link to project for easier querying
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([fragmentId])
+  @@index([projectId])
+  @@index([filePath])
+  @@index([shipperId])
+  @@index([createdAt(sort: Desc)])
+}
+
+model GitFragment {
+  id               String        @id @default(uuid())
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  title            String
+  commitHash       String
+  branch           String        @default("main")
+  message          String?
+  authorEmail      String?
+  authorName       String?
+  projectId        String
+  parentFragmentId String?
+  parentFragment   GitFragment?  @relation("GitFragmentHierarchy", fields: [parentFragmentId], references: [id])
+  childFragments   GitFragment[] @relation("GitFragmentHierarchy")
+  project          Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([commitHash])
+  @@index([branch])
+  @@index([createdAt(sort: Desc)])
+}
+
+model Project {
+  id                    String    @id @default(uuid())
+  name                  String
+  subtitle              String? // AI-generated project subtitle
+  logo                  String? // Emoji logo for the project
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  activeStreamId        String? // Stream ID for resumable streams
+  activeStreamStartedAt DateTime? // When the current stream started (for freshness checks)
+
+  // Build status tracking
+  buildStatus          ProjectBuildStatus @default(IDLE)
+  buildStatusUpdatedAt DateTime?
+  buildError           String?            @db.Text // Store error message if status is ERROR
+
+  // Legacy: Personal projects (for backward compatibility)
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // New: Team projects
+  teamId String?
+  team   Team?   @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  messages         Message[]
+  messagingVersion Int         @default(1) // 1 = v1 (legacy), 2 = v2 (streaming)
+  v2Messages       V2Message[]
+  updatedFiles     Json? // List of files that have been updated
+  sandboxId        String?
+  sandboxCreatedAt DateTime?
+  sandboxExpiresAt DateTime?
+  sandboxUrl       String?
+  sandboxProvider  String?     @default("modal") // Sandbox provider: "modal" or "daytona"
+  activeFragmentId String? // ID of the fragment currently loaded in the sandbox
+
+  // Daytona-specific fields
+  daytonaSandboxId String? // Daytona sandbox identifier
+  gitRepositoryUrl String? // Git repository URL for the project
+  currentBranch    String?   @default("main") // Current git branch
+  gitCommitHash    String? // Current commit hash
+  // Deployment metadata
+  subdomain        String? // Shipper subdomain (e.g., "my-app" for my-app.shipper.now)
+  deploymentUrl    String? // Public URL of the deployed app (can be custom domain or subdomain)
+  deployedAt       DateTime? // When the project was last deployed
+  deployedRef      String? // Commit hash or fragment id that was deployed
+
+  // Payment and subscription status
+  paymentStatus   PaymentStatus @default(ACTIVE) // Payment status for domain features
+  gracePeriodEnds DateTime? // When grace period ends (if in grace period)
+
+  // GitHub integration
+  githubRepositoryUrl    String?
+  githubRepoOwner        String?
+  githubRepoName         String?
+  githubBranch           String?   @default("main")
+  lastGithubSyncAt       DateTime?
+  githubConnectionStatus String? // 'connected' | 'disconnected' | 'error'
+
+  v2Fragments         V2Fragment[]
+  gitFragments        GitFragment[] // Git-based fragments for Daytona
+  chatStreams         ChatStream[]
+  halInteractions     HalInteraction[] // HAL advisor interactions
+  halChatMessages     HalChatMessage[] // HAL chat messages
+  projectErrors       ProjectError[] // Auto-fix error tracking
+  autoFixSessions     AutoFixSession[] // Auto-fix session tracking
+  deployments         Deployment[] // Deployments from this project
+  componentEdits      ComponentEditMetadata[] // Component-level edit metadata for undo/redo
+  sourceTemplate      CommunityTemplate?      @relation("TemplateSource")
+  remixedFromTemplate TemplateRemix?          @relation("RemixedFrom")
+  customDomains       CustomDomain[]
+  secrets             project_secrets[]
+
+  // Turso database integration
+  tursoDatabaseName  String?
+  tursoDatabaseUrl   String?
+  tursoDatabaseToken String?
+  tursoCreatedAt     DateTime?
+
+  // Shipper Cloud / Convex integration
+  shipperCloudEnabled Boolean           @default(false) // Whether Shipper Cloud is enabled for this project
+  convexDeployment    ConvexDeployment?
+
+  // AI Proxy token for user apps to call our AI endpoint
+  // This token authenticates requests from user's deployed apps to our AI proxy
+  aiProxyToken          String?   @unique
+  aiProxyTokenCreatedAt DateTime?
+  aiEnabled             Boolean   @default(false) // Whether AI is enabled for this project
+
+  // Code Import - link to the import record if this project was created via import
+  codeImport CodeImport?
+
+  // Original platform (copied from CodeImport for easy access)
+  importedFrom ImportedFromPlatform?
+
+  // Backend migration tracking for imported projects
+  backendMigrationStatus      BackendMigrationStatus?
+  backendMigrationStartedAt   DateTime?
+  backendMigrationCompletedAt DateTime?
+
+  // Connectors
+  sharedConnectors SharedConnector[]
+}
+
+model ChatStream {
+  id        String   @id @default(cuid())
+  projectId String
+  streamId  String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  status    String   @default("active")
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([streamId])
+  @@index([status])
+}
+
+model Team {
+  id                    String       @id @default(cuid())
+  name                  String
+  description           String?
+  slug                  String       @unique
+  isPersonal            Boolean      @default(false)
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
+  activeSandboxBuilds   Int          @default(0)
+  buildRateLimitResetAt DateTime?
+  buildsThisHour        Int          @default(0)
+  maxConcurrentBuilds   Int          @default(3)
+  projects              Project[]
+  members               TeamMember[]
+  uploads               Upload[]
+
+  // Billing fields
+  billingEmail         String?
+  billingEnabled       Boolean @default(false)
+  stripeCustomerId     String? @unique
+  stripeSubscriptionId String? @unique
+
+  // Convex usage tracking
+  convexUsagePeriods ConvexUsagePeriod[]
+  sharedConnectors   SharedConnector[]
+
+  @@index([stripeCustomerId])
+  @@map("teams")
+}
+
+model TeamMember {
+  id        String   @id @default(cuid())
+  role      TeamRole @default(MEMBER)
+  joinedAt  DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  userId    String
+  teamId    String
+  team      Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, teamId])
+  @@map("team_members")
+}
+
+model CreditPurchase {
+  id              String         @id @default(cuid())
+  userId          String
+  credits         Int
+  amountPaid      Int
+  stripePaymentId String         @unique
+  status          PurchaseStatus
+  createdAt       DateTime       @default(now())
+  metadata        Json?
+  user            User           @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+model CreditTransaction {
+  id          String     @id @default(cuid())
+  userId      String
+  amount      Int
+  type        CreditType
+  description String
+  metadata    Json?
+  createdAt   DateTime   @default(now())
+  user        User       @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([type])
+}
+
+/// Shipper Cloud Credits - Tracks credit transactions for deployed app usage
+/// Separate from Builder credits (CreditTransaction)
+/// 1 credit = 1 cent ($0.01)
+model CloudCreditTransaction {
+  id          String          @id @default(cuid())
+  userId      String
+  amount      Int // Positive for additions (purchase, bonus), negative for usage
+  type        CloudCreditType
+  description String
+  metadata    Json? // Extra data (e.g., Stripe payment ID, usage breakdown)
+  createdAt   DateTime        @default(now())
+  user        User            @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([type])
+  @@map("cloud_credit_transactions")
+}
+
+/// Shipper Cloud Credit Purchase - Records top-up purchases
+model CloudCreditPurchase {
+  id              String                    @id @default(cuid())
+  userId          String
+  stripePaymentId String                    @unique
+  credits         Int // Number of credits purchased
+  amountCents     Int // Amount paid in cents
+  status          CloudCreditPurchaseStatus @default(PENDING)
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @updatedAt
+  user            User                      @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@map("cloud_credit_purchases")
+}
+
+model V2Message {
+  id        String   @id @default(cuid())
+  projectId String
+  role      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  content   String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([createdAt(sort: Desc)])
+}
+
+model HalInteraction {
+  id                 String    @id @default(cuid())
+  userId             String
+  projectId          String
+  firstAnalyzedAt    DateTime  @default(now())
+  lastAnalyzedAt     DateTime?
+  lastInteractionAt  DateTime?
+  interactionCount   Int       @default(0)
+  clickedSuggestions Json      @default("[]")
+  analysisData       Json      @default("{}")
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  project            Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user               User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, projectId])
+  @@index([userId, lastInteractionAt])
+  @@index([projectId])
+  @@map("hal_interactions")
+}
+
+model HalUserPreferences {
+  id                   String   @id @default(cuid())
+  userId               String   @unique
+  preferredCategories  String[]
+  dismissedPatterns    String[]
+  interactionStyle     String   @default("detailed")
+  difficultyPreference String   @default("mixed")
+  focusAreas           String[]
+  completionRate       Int      @default(0)
+  lastAnalyzedAt       DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("hal_user_preferences")
+}
+
+model HalChatMessage {
+  id          String          @id @default(cuid())
+  projectId   String
+  userId      String
+  role        String
+  content     String
+  createdAt   DateTime        @default(now())
+  parts       Json?
+  hatType     String          @default("generalist")
+  project     Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  suggestions HalSuggestion[]
+
+  @@index([projectId, createdAt])
+  @@index([projectId, hatType, createdAt])
+  @@index([userId])
+  @@map("hal_chat_messages")
+}
+
+model HalSuggestion {
+  id           String         @id @default(cuid())
+  messageId    String
+  suggestionId String
+  title        String
+  description  String
+  icon         String
+  color        String
+  prompt       String
+  clicked      Boolean        @default(false)
+  clickedAt    DateTime?
+  createdAt    DateTime       @default(now())
+  targetChat   String         @default("builder")
+  hatType      String         @default("generalist")
+  message      HalChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+  @@index([clicked])
+  @@map("hal_suggestions")
+}
+
+model ProjectError {
+  id              String           @id @default(cuid())
+  projectId       String
+  errorType       ErrorType
+  errorDetails    Json
+  severity        ErrorSeverity
+  autoFixable     Boolean          @default(true)
+  status          ErrorStatus      @default(DETECTED)
+  detectedAt      DateTime         @default(now())
+  resolvedAt      DateTime?
+  fixAttempts     Int              @default(0)
+  lastFixAttempt  DateTime?
+  fixStrategy     String?
+  fragmentId      String?
+  fragment        V2Fragment?      @relation(fields: [fragmentId], references: [id], onDelete: Cascade)
+  project         Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  autoFixSessions AutoFixSession[] @relation("AutoFixSessionToProjectError")
+
+  @@index([projectId])
+  @@index([fragmentId])
+  @@index([errorType])
+  @@index([severity])
+  @@index([status])
+  @@index([detectedAt])
+  @@index([severity, status])
+  @@map("project_errors")
+}
+
+model AutoFixSession {
+  id              String         @id @default(cuid())
+  projectId       String
+  userId          String
+  errorsDetected  Json
+  fixesApplied    Json
+  successRate     Float?
+  status          AutoFixStatus  @default(STARTED)
+  startedAt       DateTime       @default(now())
+  completedAt     DateTime?
+  totalErrors     Int            @default(0)
+  successfulFixes Int            @default(0)
+  failedFixes     Int            @default(0)
+  skippedFixes    Int            @default(0)
+  project         Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user            User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectErrors   ProjectError[] @relation("AutoFixSessionToProjectError")
+
+  @@index([projectId])
+  @@index([userId])
+  @@index([status])
+  @@index([startedAt])
+  @@map("auto_fix_sessions")
+}
+
+model Deployment {
+  id           String    @id @default(cuid())
+  appId        String    @unique
+  name         String
+  url          String
+  files        Json
+  entryPoint   String    @default("index.html")
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  lastAccessed DateTime?
+  projectId    String    @unique
+  userId       String?
+  published    Boolean   @default(true)
+  project      Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user         User?     @relation(fields: [userId], references: [id])
+
+  @@index([appId])
+  @@index([projectId])
+  @@index([name])
+  @@index([createdAt])
+  @@index([userId])
+  @@index([published])
+  @@map("deployments")
+}
+
+model CommunityTemplate {
+  id                 String                @id @default(cuid())
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
+  name               String
+  slug               String                @unique
+  description        String
+  shortDescription   String
+  logo               String
+  thumbnailUrl       String?
+  screenshots        Json?
+  demoUrl            String?
+  sourceProjectId    String?               @unique
+  sourceFragmentId   String
+  categoryId         String?
+  tags               String[]
+  remixCount         Int                   @default(0)
+  viewCount          Int                   @default(0)
+  saveCount          Int                   @default(0)
+  featured           Boolean               @default(false)
+  verified           Boolean               @default(false)
+  published          Boolean               @default(true)
+  authorId           String?
+  authorName         String                @default("Shipper Team")
+  chatHistoryVisible Boolean               @default(true)
+  seedPrompt         String?
+  price              Int?                  @default(0)
+  stripeProductId    String?
+  stripePriceId      String?
+  author             User?                 @relation(fields: [authorId], references: [id])
+  category           TemplateCategory?     @relation(fields: [categoryId], references: [id])
+  sourceFragment     V2Fragment            @relation(fields: [sourceFragmentId], references: [id], onDelete: Cascade)
+  sourceProject      Project?              @relation("TemplateSource", fields: [sourceProjectId], references: [id])
+  chatMessages       TemplateChatMessage[]
+  comments           TemplateComment[]
+  likes              TemplateLike[]
+  purchases          TemplatePurchase[]
+  remixes            TemplateRemix[]
+  saves              TemplateSave[]
+
+  @@index([slug])
+  @@index([categoryId])
+  @@index([featured, published])
+  @@index([remixCount(sort: Desc)])
+  @@index([createdAt(sort: Desc)])
+  @@index([authorId])
+  @@map("community_templates")
+}
+
+model TemplateCategory {
+  id          String              @id @default(cuid())
+  name        String              @unique
+  slug        String              @unique
+  description String?
+  icon        String?
+  order       Int                 @default(0)
+  parentId    String?
+  templates   CommunityTemplate[]
+  parent      TemplateCategory?   @relation("CategoryHierarchy", fields: [parentId], references: [id])
+  children    TemplateCategory[]  @relation("CategoryHierarchy")
+
+  @@index([order])
+  @@map("template_categories")
+}
+
+model TemplateLike {
+  id         String            @id @default(cuid())
+  createdAt  DateTime          @default(now())
+  templateId String
+  userId     String
+  template   CommunityTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([templateId, userId])
+  @@index([templateId])
+  @@index([userId])
+  @@map("template_likes")
+}
+
+model TemplateComment {
+  id         String            @id @default(cuid())
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+  templateId String
+  userId     String
+  content    String
+  parentId   String?
+  parent     TemplateComment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies    TemplateComment[] @relation("CommentReplies")
+  template   CommunityTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([templateId, createdAt(sort: Desc)])
+  @@index([userId])
+  @@map("template_comments")
+}
+
+model TemplateSave {
+  id         String            @id @default(cuid())
+  createdAt  DateTime          @default(now())
+  templateId String
+  userId     String
+  template   CommunityTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([templateId, userId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("template_saves")
+}
+
+model TemplateRemix {
+  id               String            @id @default(cuid())
+  createdAt        DateTime          @default(now())
+  templateId       String
+  userId           String
+  remixedProjectId String            @unique
+  remixedProject   Project           @relation("RemixedFrom", fields: [remixedProjectId], references: [id], onDelete: Cascade)
+  template         CommunityTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([templateId, createdAt(sort: Desc)])
+  @@index([userId])
+  @@map("template_remixes")
+}
+
+model TemplateChatMessage {
+  id         String            @id @default(cuid())
+  createdAt  DateTime          @default(now())
+  templateId String
+  role       String
+  content    String
+  order      Int
+  template   CommunityTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@index([templateId, order])
+  @@map("template_chat_messages")
+}
+
+model TemplatePurchase {
+  id              String            @id @default(cuid())
+  createdAt       DateTime          @default(now())
+  templateId      String
+  userId          String
+  priceAtPurchase Int
+  template        CommunityTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([templateId, userId])
+  @@index([userId])
+  @@map("template_purchases")
+}
+
+model Upload {
+  id             String     @id @default(cuid())
+  filename       String
+  originalName   String
+  mimeType       String
+  size           Int
+  storageKey     String     @unique
+  url            String
+  thumbnailUrl   String?
+  uploadType     UploadType
+  width          Int?
+  height         Int?
+  tags           String[]
+  description    String?
+  usedInProjects String[]
+  lastUsedAt     DateTime?
+  userId         String
+  teamId         String?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+  deletedAt      DateTime?
+  team           Team?      @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user           User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, uploadType])
+  @@index([teamId])
+  @@index([createdAt])
+  @@index([tags])
+  @@index([deletedAt])
+  @@map("uploads")
+}
+
+model CustomDomain {
+  id                   String          @id @default(cuid())
+  projectId            String
+  domain               String          @unique
+  cloudflareHostnameId String?
+  isPrimary            Boolean         @default(false)
+  status               DomainStatus    @default(PENDING_VALIDATION)
+  sslStatus            DomainSSLStatus @default(PENDING)
+  verificationErrors   Json?
+  cnameTarget          String?
+  txtName              String?
+  txtValue             String?
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+  verifiedAt           DateTime?
+  lastCheckedAt        DateTime?
+  project              Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([status])
+  @@index([domain])
+  @@index([projectId, isPrimary])
+  @@map("custom_domains")
+}
+
+model project_secrets {
+  id          String   @id @default(cuid())
+  projectId   String
+  key         String
+  value       String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  createdBy   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, key])
+  @@index([key])
+  @@index([projectId])
+}
+
+enum SubscriptionStatus {
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  UNPAID
+  PAUSED
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum TeamRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+}
+
+enum MessageType {
+  RESULT
+  ERROR
+}
+
+enum MembershipTier {
+  FREE
+  PRO
+  ENTERPRISE
+}
+
+enum PurchaseStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REFUNDED
+}
+
+enum CreditType {
+  PURCHASE
+  MONTHLY_ALLOCATION
+  AI_GENERATION
+  SANDBOX_USAGE
+  DEPLOYMENT
+  TEAM_COLLABORATION
+  BONUS
+  REFUND
+}
+
+/// Types of Shipper Cloud credit transactions
+enum CloudCreditType {
+  PURCHASE // One-time credit purchase (top-up)
+  FIRST_DEPLOY_BONUS // $1 bonus on first Shipper Cloud deployment
+  PROMOTIONAL // Promotional/bonus credits
+  USAGE // Deducted for Convex usage (DB, storage, bandwidth, etc.)
+  REFUND // Credit refund
+  AUTO_TOP_UP // Automatic top-up purchase
+}
+
+/// Status of Cloud credit purchases
+enum CloudCreditPurchaseStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REFUNDED
+}
+
+enum ErrorType {
+  COMPILATION
+  RUNTIME
+  IMPORT
+  NAVIGATION
+  BUILD
+  TYPE_SCRIPT
+  ESLINT
+  DEPENDENCY
+  OTHER
+}
+
+enum ErrorSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum ErrorStatus {
+  DETECTED
+  FIXING
+  RESOLVED
+  FAILED
+  IGNORED
+}
+
+enum AutoFixStatus {
+  STARTED
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum ProjectBuildStatus {
+  IDLE
+  GENERATING
+  BUILDING
+  READY
+  ERROR
+  INITIALIZING
+  AWAITING_SANDBOX
+}
+
+// ==========================================
+// Code Import System
+// ==========================================
+
+enum CodeImportSource {
+  GITHUB
+  ZIP_UPLOAD
+  FOLDER_UPLOAD
+}
+
+enum CodeImportStatus {
+  QUEUED
+  FETCHING
+  ANALYZING
+  CREATING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+// Original platform the project was exported from
+enum ImportedFromPlatform {
+  LOVABLE // Supabase-based, may have edge functions
+  BASE44 // Entity-based SDK with integrations
+  BOLT // No backend, just frontend
+  V0 // No backend, just frontend  
+  GENERIC_VITE // Standard Vite/React project
+  OTHER // Unknown, needs manual analysis
+}
+
+// Backend migration status for imported projects
+enum BackendMigrationStatus {
+  NOT_NEEDED // No backend to migrate (Bolt, v0, Generic)
+  PENDING // Waiting for user to approve migration
+  IN_PROGRESS // Migration is running
+  COMPLETED // Migration finished successfully
+  SKIPPED // User chose to skip migration
+  FAILED // Migration failed
+}
+
+model CodeImport {
+  id        String   @id @default(uuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Source information
+  source       CodeImportSource
+  sourceUrl    String?
+  sourceName   String
+  sourceBranch String?
+
+  // Original platform (user-selected during import)
+  importedFrom ImportedFromPlatform @default(OTHER)
+
+  // User who initiated the import
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Import status tracking
+  status        CodeImportStatus @default(QUEUED)
+  statusMessage String?
+  errorMessage  String?          @db.Text
+  progress      Int              @default(0)
+
+  // Analysis results
+  detectedFramework String?
+  detectedLanguage  String?
+  fileCount         Int?
+  totalSizeBytes    Int?
+
+  // Link to created project (after successful import)
+  projectId String?  @unique
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+  @@index([source])
+  @@index([importedFrom])
+  @@index([createdAt(sort: Desc)])
+  @@map("code_imports")
+}
+
+enum UploadType {
+  IMAGE
+  DOCUMENT
+  VIDEO
+  AUDIO
+  OTHER
+}
+
+enum DomainStatus {
+  PENDING_VALIDATION
+  ACTIVE
+  FAILED
+  DELETED
+}
+
+enum DomainSSLStatus {
+  PENDING
+  ACTIVE
+  FAILED
+}
+
+enum PaymentStatus {
+  ACTIVE // User has active subscription/payment
+  GRACE_PERIOD // Payment failed, in grace period
+  SUSPENDED // Grace period expired, features suspended
+}
+
+// ==========================================
+// Convex / Shipper Cloud Integration
+// ==========================================
+
+model ConvexDeployment {
+  id        String  @id @default(cuid())
+  projectId String  @unique
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // Convex-specific identifiers
+  convexProjectId      String // Convex project ID
+  convexDeploymentName String @unique // Unique deployment name (e.g., "happy-animal-123")
+  convexDeploymentUrl  String // Full deployment URL
+
+  // Encrypted deploy key for CLI operations
+  deployKeyEncrypted String @db.Text
+
+  // Log stream webhook configuration
+  webhookSecretEncrypted String?   @db.Text // Encrypted webhook secret for HMAC verification
+  webhookConfiguredAt    DateTime? // When the webhook was configured
+
+  // Deployment status
+  status          ConvexDeploymentStatus @default(ACTIVE)
+  lastDeployedAt  DateTime?
+  lastDeployError String?                @db.Text
+
+  // Sandbox setup tracking - prevents broken state if deployment is interrupted
+  // true = sandbox files created, packages installed, env vars set
+  // false = only backend provisioned, setup needs to be re-run
+  setupComplete    Boolean   @default(false)
+  setupCompletedAt DateTime?
+
+  // ==========================================
+  // Usage Aggregates (updated on each event)
+  // ==========================================
+
+  // Current billing period
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+
+  // Function execution metrics (cumulative for current period)
+  totalFunctionCalls          BigInt @default(0)
+  totalActionComputeMs        BigInt @default(0)
+  totalDatabaseBandwidthBytes BigInt @default(0)
+  totalFileBandwidthBytes     BigInt @default(0)
+  totalVectorBandwidthBytes   BigInt @default(0)
+
+  // Storage snapshots (last known values - updated on storage events)
+  lastStorageUpdateAt  DateTime?
+  documentStorageBytes BigInt    @default(0)
+  indexStorageBytes    BigInt    @default(0)
+  fileStorageBytes     BigInt    @default(0)
+  vectorStorageBytes   BigInt    @default(0)
+  backupStorageBytes   BigInt    @default(0)
+
+  // Credits used (calculated from usage) - stored as Float for accuracy, rounded only when syncing to Stripe
+  creditsUsedThisPeriod Float     @default(0)
+  lastUsageAt           DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([convexDeploymentName])
+  @@map("convex_deployments")
+}
+
+enum ConvexDeploymentStatus {
+  ACTIVE // Deployment is active and healthy
+  DEPLOYING // Deployment in progress
+  ERROR // Last deployment failed
+  DELETED // Deployment has been deleted
+}
+
+// Aggregated usage per billing period (monthly)
+model ConvexUsagePeriod {
+  id     String @id @default(cuid())
+  teamId String
+  team   Team   @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  // Billing period (typically monthly)
+  periodStart DateTime
+  periodEnd   DateTime
+
+  // Aggregated function metrics
+  totalFunctionCalls   BigInt @default(0)
+  totalActionComputeMs BigInt @default(0) // Convert to GB-hours for billing
+
+  // Aggregated bandwidth (sum of all reads + writes)
+  totalDatabaseBandwidthBytes BigInt @default(0)
+  totalFileBandwidthBytes     BigInt @default(0)
+  totalVectorBandwidthBytes   BigInt @default(0)
+
+  // Peak storage values (max during period - used for storage billing)
+  peakDatabaseStorageBytes BigInt @default(0)
+  peakFileStorageBytes     BigInt @default(0)
+  peakVectorStorageBytes   BigInt @default(0)
+
+  // Calculated costs (in cents)
+  functionCallsCost     Int @default(0)
+  actionComputeCost     Int @default(0)
+  databaseBandwidthCost Int @default(0)
+  databaseStorageCost   Int @default(0)
+  fileBandwidthCost     Int @default(0)
+  fileStorageCost       Int @default(0)
+  vectorBandwidthCost   Int @default(0)
+  vectorStorageCost     Int @default(0)
+  totalCost             Int @default(0)
+
+  // Stripe reporting
+  stripeUsageRecordId String? // ID from Stripe usage record
+  reportedToStripeAt  DateTime?
+
+  // Status
+  status ConvexBillingStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([teamId, periodStart, periodEnd])
+  @@index([teamId])
+  @@index([periodStart, periodEnd])
+  @@index([status])
+  @@map("convex_usage_periods")
+}
+
+enum ConvexBillingStatus {
+  PENDING // Collecting usage
+  CALCULATED // Costs calculated
+  REPORTED // Reported to Stripe
+  BILLED // Invoice created
+  PAID // Payment received
+}
+
+// ==========================================
+// Auto Top-Up Configuration
+// ==========================================
+
+model AutoTopUpConfig {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Top-up settings
+  enabled          Boolean @default(false)
+  thresholdCredits Int     @default(100) // Trigger when balance falls below this
+  topUpCredits     Int     @default(400) // Amount of credits to purchase
+
+  // Stripe payment method for auto top-up
+  stripePaymentMethodId String?
+
+  // Limits to prevent runaway charges
+  maxMonthlyTopUps Int       @default(5)
+  topUpsThisMonth  Int       @default(0)
+  monthlyResetAt   DateTime?
+
+  // Tracking
+  lastTopUpAt         DateTime?
+  lastTopUpAmount     Int?
+  lastTopUpError      String?
+  consecutiveFailures Int       @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([enabled])
+  @@index([lastTopUpAt])
+  @@map("auto_top_up_configs")
+}
+
+// Credit Grant tracking (synced from Stripe)
+model StripeCreditGrant {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Stripe identifiers
+  stripeCreditGrantId String @unique
+  stripeCustomerId    String
+
+  // Grant details
+  name        String
+  category    String // 'paid' or 'promotional'
+  amountCents Int // Original amount in cents
+  credits     Int // Converted to Shipper credits
+  currency    String @default("usd")
+
+  // Dates
+  effectiveAt DateTime?
+  expiresAt   DateTime?
+  voidedAt    DateTime?
+
+  // Status tracking
+  status CreditGrantStatus @default(ACTIVE)
+
+  // Metadata
+  metadata Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([stripeCustomerId])
+  @@index([status])
+  @@index([expiresAt])
+  @@map("stripe_credit_grants")
+}
+
+enum CreditGrantStatus {
+  PENDING // Not yet effective
+  ACTIVE // Available for use
+  DEPLETED // Fully used
+  EXPIRED // Past expiration date
+  VOIDED // Manually voided
+}
+
+// ==========================================
+// Connector System
+// ==========================================
+
+// Personal Connectors - User-level connections that bring context INTO the AI builder
+// Examples: Notion, Linear, Jira, Miro - user connects their account, AI can read their docs/tickets
+model PersonalConnector {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Provider identification
+  provider PersonalConnectorProvider
+
+  // For custom MCP servers (when provider = CUSTOM)
+  customName String?
+  customUrl  String?
+
+  // OAuth tokens (encrypted)
+  accessToken  String    @db.Text
+  refreshToken String?   @db.Text
+  expiresAt    DateTime?
+
+  // Provider-specific metadata (workspace name, user email, avatar, etc.)
+  metadata Json?
+
+  // Connection status
+  status       ConnectorStatus @default(ACTIVE)
+  lastUsedAt   DateTime?
+  lastSyncAt   DateTime?
+  errorMessage String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, provider, customUrl])
+  @@index([userId])
+  @@index([provider])
+  @@index([status])
+  @@map("personal_connectors")
+}
+
+enum PersonalConnectorProvider {
+  NOTION // Notion pages and databases
+  LINEAR // Linear issues and projects
+  ATLASSIAN // Jira tickets + Confluence docs
+  MIRO // Miro boards and wireframes
+  N8N // n8n workflows
+  FIGMA // Figma designs (migrate existing FigmaConnection here later)
+  CUSTOM // Custom MCP server URL
+}
+
+// Shared Connectors - Team/Project-level integrations that extend app capabilities
+// Examples: Stripe, Supabase, Shopify - configured once, AI can add these features to generated apps
+model SharedConnector {
+  id String @id @default(cuid())
+
+  // Scope: either team-level or project-level
+  teamId    String?
+  team      Team?    @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  projectId String?
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // Connector type
+  connectorType SharedConnectorType
+
+  // Display name (e.g., "Production Stripe", "Dev Supabase")
+  name String?
+
+  // Encrypted credentials (JSON with API keys, secrets, etc.)
+  credentials String @db.Text
+
+  // Connector-specific configuration
+  config Json?
+
+  // Status
+  enabled      Boolean         @default(true)
+  status       ConnectorStatus @default(ACTIVE)
+  lastUsedAt   DateTime?
+  errorMessage String?
+
+  // Audit
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  createdById String
+  createdBy   User     @relation("SharedConnectorCreator", fields: [createdById], references: [id])
+
+  @@unique([teamId, connectorType])
+  @@unique([projectId, connectorType])
+  @@index([teamId])
+  @@index([projectId])
+  @@index([connectorType])
+  @@index([status])
+  @@map("shared_connectors")
+}
+
+enum SharedConnectorType {
+  STRIPE // Stripe payments
+  SUPABASE // Supabase backend
+  SHOPIFY // Shopify e-commerce
+  FIREBASE // Firebase backend
+  CLERK // Clerk auth
+  RESEND // Resend email
+  TWILIO // Twilio SMS
+  PERPLEXITY // Perplexity AI search
+  ELEVENLABS // ElevenLabs voice AI
+  FIRECRAWL // Firecrawl web scraping
+}
+
+enum ConnectorStatus {
+  ACTIVE // Working normally
+  EXPIRED // Token expired, needs refresh
+  ERROR // Connection error
+  REVOKED // User revoked access
+  PENDING // Setup in progress
+}
