@@ -1,0 +1,22 @@
+{
+  "buildCommand": "cd ../.. && turbo build --filter=@shipper/database && pnpm --filter @shipper/database db:deploy && turbo build --filter=web",
+  "installCommand": "cd ../.. && pnpm install --frozen-lockfile",
+  "outputDirectory": ".next",
+  "framework": "nextjs",
+  "ignoreCommand": "npx turbo-ignore --fallback=HEAD^1",
+  "git": {
+    "deploymentEnabled": {
+      "main": true,
+      "staging": true,
+      "*": false
+    }
+  },
+  "functions": {
+    "src/app/api/inngest/route.ts": {
+      "maxDuration": 300
+    },
+    "src/app/api/projects/[projectId]/stream/route.ts": {
+      "maxDuration": 300
+    }
+  }
+}

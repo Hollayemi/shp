@@ -1,0 +1,54 @@
+{
+  "name": "shipper.now",
+  "version": "3.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.17.0",
+  "scripts": {
+    "dev": "turbo dev",
+    "dev:web": "turbo dev --filter=web",
+    "dev:api": "turbo dev --filter=api",
+    "dev:billing": "turbo dev --filter=billing",
+    "build": "turbo build",
+    "build:web": "turbo build --filter=web",
+    "build:api": "turbo build --filter=api",
+    "build:billing": "turbo build --filter=billing",
+    "start": "turbo start",
+    "start:web": "turbo start --filter=web",
+    "start:api": "turbo start --filter=api",
+    "start:billing": "turbo start --filter=billing",
+    "lint": "turbo lint",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "turbo typecheck",
+    "db:generate": "turbo db:generate",
+    "db:migrate": "turbo db:migrate",
+    "db:migrate:local": "turbo db:migrate:local",
+    "db:migrate:deploy": "turbo db:deploy",
+    "db:seed:categories": "tsx prisma/seed-categories.ts"
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2",
+    "prettier-plugin-tailwindcss": "^0.7.0",
+    "prisma": "6.17.1",
+    "turbo": "^2.3.3",
+    "typescript": "^5.9.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@prisma/client",
+      "@prisma/engines",
+      "@tailwindcss/oxide",
+      "prisma",
+      "sharp",
+      "unrs-resolver"
+    ],
+    "overrides": {
+      "@aws-sdk/client-s3": "3.913.0",
+      "@auth/core": "0.41.0"
+    }
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}

@@ -1,0 +1,161 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "ui": "tui",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": [".next/**", "!.next/cache/**", "dist/**"],
+      "env": ["NEXTAUTH_SECRET", "NEXTAUTH_URL", "NEXT_PUBLIC_APP_URL"]
+    },
+    "web#build": {
+      "dependsOn": ["^build"],
+      "outputs": [".next/**", "!.next/cache/**"],
+      "env": [
+        "ADMIN_ACCOUNT",
+        "NEXTAUTH_SECRET",
+        "NEXTAUTH_URL",
+        "NEXT_PUBLIC_APP_URL",
+        "STRIPE_SECRET_KEY",
+        "STRIPE_PUBLISHABLE_KEY",
+        "STRIPE_WEBHOOK_SECRET",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "AZURE_OPENAI_ENDPOINT",
+        "AZURE_OPENAI_DEPLOYMENT_NAME",
+        "AZURE_OPENAI_API_VERSION",
+        "POSTHOG_KEY",
+        "POSTHOG_HOST",
+        "LANGFUSE_PUBLIC_KEY",
+        "LANGFUSE_SECRET_KEY",
+        "LANGFUSE_HOST",
+        "LANGFUSE_BASE_URL",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_REGION",
+        "AWS_S3_BUCKET_NAME",
+        "INNGEST_EVENT_KEY",
+        "INNGEST_SIGNING_KEY",
+        "MEM0_API_KEY",
+        "EXA_API_KEY",
+        "DAYTONA_API_KEY",
+        "E2B_API_KEY",
+        "NEXT_PUBLIC_API_URL",
+        "SHIPPER_API_KEY",
+        "TURSO_API_TOKEN",
+        "TURSO_ORG_NAME",
+        "TURSO_DB_GROUP",
+        "OPENROUTER_API_KEY",
+        "HELICONE_API_KEY",
+        "REDIS_URL",
+        "GITHUB_CLIENT_ID",
+        "GITHUB_CLIENT_SECRET",
+        "GITHUB_APP_ID",
+        "GITHUB_APP_PRIVATE_KEY",
+        "GOOGLE_CLIENT_ID",
+        "GOOGLE_CLIENT_SECRET",
+        "ENCHARGE_WRITE_KEY",
+        "ENCHARGE_API_KEY",
+        "FRILL_SCRIPT_KEY",
+        "CLOUDFLARE_R2_ACCOUNT_ID",
+        "CLOUDFLARE_R2_ACCESS_KEY_ID",
+        "CLOUDFLARE_R2_SECRET_ACCESS_KEY",
+        "CLOUDFLARE_R2_BUCKET_NAME",
+        "CLOUDFLARE_R2_PUBLIC_URL",
+        "CLOUDFLARE_API_TOKEN",
+        "CLOUDFLARE_ZONE_ID",
+        "CLOUDFLARE_ACCOUNT_ID",
+        "CLOUDFLARE_FALLBACK_ORIGIN",
+        "ENTRI_CLIENT_SECRET",
+        "DATABASE_URL_UNPOOLED"
+      ]
+    },
+    "@shipper/database#build": {
+      "dependsOn": [],
+      "outputs": ["generated/**"],
+      "env": ["DATABASE_URL"]
+    },
+    "api#build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**"],
+      "env": [
+        "DATABASE_URL",
+        "NEXTAUTH_SECRET",
+        "NEXTAUTH_URL",
+        "SHIPPER_API_KEY",
+        "DAYTONA_API_KEY",
+        "TURSO_API_TOKEN",
+        "TURSO_ORG_NAME",
+        "TURSO_DB_GROUP",
+        "BILLING_WEBHOOK_URL"
+      ]
+    },
+    "billing#build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**"],
+      "env": [
+        "DATABASE_URL",
+        "BILLING_API_KEY",
+        "SHIPPER_API_KEY",
+        "STRIPE_SECRET_KEY",
+        "STRIPE_SECRET_KEY_LIVE",
+        "CONVEX_WEBHOOK_SECRET",
+        "STRIPE_CONVEX_PRODUCT_ID",
+        "STRIPE_CONVEX_FUNCTION_CALLS_PRICE_ID",
+        "STRIPE_CONVEX_ACTION_COMPUTE_PRICE_ID",
+        "STRIPE_CONVEX_DB_BANDWIDTH_PRICE_ID",
+        "STRIPE_CONVEX_DB_STORAGE_PRICE_ID",
+        "STRIPE_CONVEX_FILE_BANDWIDTH_PRICE_ID",
+        "STRIPE_CONVEX_FILE_STORAGE_PRICE_ID",
+        "STRIPE_CONVEX_VECTOR_BANDWIDTH_PRICE_ID",
+        "STRIPE_CONVEX_VECTOR_STORAGE_PRICE_ID"
+      ]
+    },
+    "dev": {
+      "dependsOn": ["^db:generate"],
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {
+      "dependsOn": ["^lint"]
+    },
+    "typecheck": {
+      "dependsOn": ["^build"]
+    },
+    "format": {
+      "cache": false
+    },
+    "db:generate": {
+      "cache": false
+    },
+    "db:migrate": {
+      "cache": false,
+      "persistent": true
+    },
+    "db:migrate:local": {
+      "cache": false
+    },
+    "db:deploy": {
+      "cache": false
+    }
+  },
+  "globalEnv": [
+    "DATABASE_URL",
+    "NODE_ENV",
+    "VERCEL",
+    "VERCEL_ENV",
+    "VERCEL_URL",
+    "VERCEL_REGION",
+    "MODAL_TOKEN_ID",
+    "MODAL_TOKEN_SECRET",
+    "CONVEX_TEAM_ACCESS_TOKEN",
+    "CONVEX_TEAM_ID",
+    "CONVEX_DEPLOY_KEY_ENCRYPTION_SECRET"
+  ],
+  "globalDependencies": [
+    "tsconfig.json",
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml"
+  ]
+}
