@@ -1,0 +1,16 @@
+import { fetchRequestHandler } from '@trpc/server/adapters/fetch';
+import { createTRPCContext } from '../../../../trpc/init';
+import { appRouter } from '../../../../trpc/routers/_app';
+
+// Force Node.js runtime for Daytona SDK compatibility
+// Edge Runtime doesn't support all Node.js APIs required by the SDK
+export const runtime = 'nodejs';
+
+const handler = (req: Request) =>
+  fetchRequestHandler({
+    endpoint: '/api/trpc',
+    req,
+    router: appRouter,
+    createContext: createTRPCContext,
+  });
+export { handler as GET, handler as POST };

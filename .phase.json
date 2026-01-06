@@ -1,0 +1,8 @@
+{
+  "version": "2",
+  "phaseApp": "Shipper-app",
+  "appId": "9991aa41-0d82-4345-a18d-427791f1320e",
+  "defaultEnv": "Development",
+  "envId": "01950ff9-f7c1-4dd8-858d-937cc83b911c",
+  "monorepoSupport": true
+}

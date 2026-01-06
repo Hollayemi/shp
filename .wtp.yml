@@ -1,0 +1,21 @@
+# config file for wtp a git worktree tool (https://github.com/satococoa/wtp)
+hooks:
+  post_create:
+    # Copy env files for each app
+    # - type: copy
+    #   from: "apps/api/.env"
+    #   to: "apps/api/.env"
+    # - type: copy
+    #   from: "apps/web/.env"
+    #   to: "apps/web/.env"
+
+    # Copy env files for each package
+    # - type: copy
+    #   from: "packages/database/.env"
+    #   to: "packages/database/.env"
+
+    # Prefer explicit, single-step setup commands
+    - type: command
+      command: "pnpm install"
+    # - type: command
+    # command: "pnpm db:migrate:dev"

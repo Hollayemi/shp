@@ -1,0 +1,21 @@
+# How to run:
+# 1. Install ngrok from https://ngrok.com/download
+# 2. Copy this file to ngrok.yml
+# 3. Replace the authtoken and domain values below with your own
+# 4. Run `ngrok start --all -config=ngrok.yml`
+
+# Replace "your-ngrok-authtoken-here" with your actual ngrok authtoken.
+
+version: "3"
+agent:
+  authtoken: your-ngrok-authtoken-here
+
+tunnels:
+  billing:
+    addr: 4004
+    proto: http
+    domain: your-own-domain-billing.ngrok.dev
+  api:
+    addr: 4000
+    proto: http
+    domain: your-own-domain.ngrok.dev

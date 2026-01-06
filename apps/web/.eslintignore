@@ -1,0 +1,31 @@
+# Generated files
+src/generated/
+**/generated/
+**/prisma/generated/
+
+# Build artifacts
+.next/
+out/
+dist/
+build/
+
+# Dependencies
+node_modules/
+
+# Inngest files (excluded from type checking)
+src/inngest/
+src/app/api/inngest/
+scripts/test-agent-with-workflow-prompt.ts
+scripts/test-inngest-workflow.ts
+
+# Environment files
+.env.local
+.env.production
+.env
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db 
