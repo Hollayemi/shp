@@ -144,10 +144,17 @@ async function validateProjectToken(token: string) {
     return null;
   }
 
+  // 🏢 WORKSPACE-CENTRIC: Include teamId for credit operations
+  if (!project.teamId) {
+    logger.warn({ msg: "No teamId found", projectId: project.id });
+    return null;
+  }
+
   return {
     projectId: project.id,
     projectName: project.name,
     userId,
+    teamId: project.teamId,
   };
 }
 
@@ -177,38 +184,40 @@ function extractCost(headers: Headers, body: any): number {
 }
 
 /**
- * Check if user has sufficient Cloud credits
+ * Check if workspace has sufficient Cloud credits
  * Uses local database as the source of truth for balance
+ * 🏢 WORKSPACE-CENTRIC: Check workspace's cloud credit balance
  */
-async function checkCloudCreditBalance(userId: string): Promise<{
+async function checkWorkspaceCloudCreditBalance(teamId: string): Promise<{
   hasCredits: boolean;
   balance: number;
   stripeCustomerId?: string;
 }> {
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
+  const team = await prisma.team.findUnique({
+    where: { id: teamId },
     select: {
       stripeCustomerId: true,
       cloudCreditBalance: true,
     },
   });
 
-  if (!user) {
+  if (!team) {
     return { hasCredits: false, balance: 0 };
   }
 
   return {
-    hasCredits: (user.cloudCreditBalance ?? 0) > 0,
-    balance: user.cloudCreditBalance ?? 0,
-    stripeCustomerId: user.stripeCustomerId ?? undefined,
+    hasCredits: (team.cloudCreditBalance ?? 0) > 0,
+    balance: team.cloudCreditBalance ?? 0,
+    stripeCustomerId: team.stripeCustomerId ?? undefined,
   };
 }
 
 /**
- * Report AI usage and deduct from local Cloud credit balance
- * Also reports to Stripe meter for billing reconciliation
+ * Report AI usage and deduct from workspace Cloud credit balance
+ * 🏢 WORKSPACE-CENTRIC: Deduct from workspace, not user
  */
-async function reportAIUsageToStripeMeter(
+async function reportWorkspaceAIUsage(
+  teamId: string,
   userId: string,
   stripeCustomerId: string | undefined,
   credits: number,
@@ -225,19 +234,19 @@ async function reportAIUsageToStripeMeter(
   }
 
   try {
-    // Deduct credits from local database (primary source of truth for balance)
-    await prisma.user.update({
-      where: { id: userId },
+    // Deduct credits from workspace (primary source of truth for balance)
+    await prisma.team.update({
+      where: { id: teamId },
       data: {
         cloudCreditBalance: { decrement: credits },
-        cloudLifetimeCreditsUsed: { increment: credits },
       },
     });
 
-    // Log the transaction
+    // Log the transaction against the workspace
     await prisma.cloudCreditTransaction.create({
       data: {
-        userId,
+        teamId,
+        userId, // Track who triggered the usage
         amount: -credits,
         type: "USAGE",
         description: `AI usage: ${metadata.model || "unknown"} - ${metadata.tokens || 0} tokens`,
@@ -252,7 +261,8 @@ async function reportAIUsageToStripeMeter(
     });
 
     logger.info({
-      msg: "Deducted AI usage from Cloud credits",
+      msg: "Deducted AI usage from workspace Cloud credits",
+      teamId,
       userId,
       credits,
       costUsd: metadata.costUsd,
@@ -335,8 +345,10 @@ async function authMiddleware(req: Request, res: Response, next: Function) {
     });
   }
 
-  // Check user has Cloud credits (not Builder credits)
-  const creditCheck = await checkCloudCreditBalance(projectInfo.userId);
+  // 🏢 WORKSPACE-CENTRIC: Check workspace has Cloud credits
+  const creditCheck = await checkWorkspaceCloudCreditBalance(
+    projectInfo.teamId,
+  );
   if (!creditCheck.hasCredits) {
     return res.status(402).json({
       error: {
@@ -441,8 +453,9 @@ async function proxyToOpenRouter(
       const credits = usdToCloudCredits(cost);
 
       if (credits > 0) {
-        // Report to Stripe meter asynchronously (don't block response)
-        reportAIUsageToStripeMeter(
+        // 🏢 WORKSPACE-CENTRIC: Report usage to workspace
+        reportWorkspaceAIUsage(
+          projectInfo.teamId,
           projectInfo.userId,
           projectInfo.stripeCustomerId,
           credits,
@@ -453,11 +466,12 @@ async function proxyToOpenRouter(
             tokens: usage?.total_tokens,
             costUsd: cost,
           },
-        ).catch((error) => {
+        ).catch((error: Error) => {
           logger.error({
-            msg: "Failed to report AI usage to Stripe meter",
+            msg: "Failed to report AI usage to workspace",
             error: error instanceof Error ? error.message : String(error),
             projectId: projectInfo.projectId,
+            teamId: projectInfo.teamId,
           });
         });
       }
@@ -486,8 +500,9 @@ async function proxyToOpenRouter(
     const credits = usdToCloudCredits(cost);
 
     if (credits > 0) {
-      // Report to Stripe meter asynchronously (don't block response)
-      reportAIUsageToStripeMeter(
+      // 🏢 WORKSPACE-CENTRIC: Report usage to workspace
+      reportWorkspaceAIUsage(
+        projectInfo.teamId,
         projectInfo.userId,
         projectInfo.stripeCustomerId,
         credits,
@@ -498,11 +513,12 @@ async function proxyToOpenRouter(
           tokens: responseBody?.usage?.total_tokens,
           costUsd: cost,
         },
-      ).catch((error) => {
+      ).catch((error: Error) => {
         logger.error({
-          msg: "Failed to report AI usage to Stripe meter",
+          msg: "Failed to report AI usage to workspace",
           error: error instanceof Error ? error.message : String(error),
           projectId: projectInfo.projectId,
+          teamId: projectInfo.teamId,
         });
       });
     }

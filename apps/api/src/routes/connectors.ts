@@ -127,6 +127,8 @@ router.get("/", async (req, res) => {
  * GET /api/v1/connectors/:provider/auth
  * Initiate OAuth flow for a personal connector
  */
+
+
 router.get("/:provider/auth", async (req, res) => {
   try {
     const { provider } = req.params;
@@ -165,6 +167,7 @@ router.get("/:provider/auth", async (req, res) => {
   }
 });
 
+
 /**
  * GET /api/v1/connectors/:provider/callback
  * Handle OAuth callback
@@ -172,6 +175,8 @@ router.get("/:provider/auth", async (req, res) => {
  * Can be called directly by OAuth provider OR proxied through webapp.
  * When proxied (x-user-id header present), returns JSON instead of HTML.
  */
+
+
 router.get("/:provider/callback", async (req, res) => {
   try {
     const { provider } = req.params;
@@ -230,6 +235,10 @@ router.get("/:provider/callback", async (req, res) => {
 
     // Exchange code for tokens (pass state for PKCE code verifier)
     const redirectUri = getRedirectUri(provider);
+    logger.info(
+      { redirectUri },
+      "Handling OAuth callback",
+    );
     const tokens = await connector.handleCallback(
       code as string,
       redirectUri,
@@ -322,6 +331,83 @@ router.get("/:provider/callback", async (req, res) => {
 });
 
 // =============================================================================
+// Personal Connector API Key Connection
+// =============================================================================
+
+/**
+ * POST /api/v1/connectors/:provider/connect
+ * Connect using API key for providers that use API key auth (not OAuth)
+ */
+router.post("/:provider/connect", async (req, res) => {
+  try {
+    const { provider } = req.params;
+    const userId = req.headers["x-user-id"] as string;
+    const { apiKey } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    if (!apiKey) {
+      return res.status(400).json({ error: "API key is required" });
+    }
+
+    const connector = connectorRegistry.getPersonalConnector(
+      provider.toUpperCase() as PersonalConnectorProvider,
+    );
+
+    if (!connector) {
+      return res.status(404).json({ error: `Unknown connector: ${provider}` });
+    }
+
+    // Check if this connector uses API key auth
+    if (connector.auth.type !== "api_key") {
+      return res.status(400).json({
+        error: `${provider} uses OAuth authentication, not API key`,
+      });
+    }
+
+    // Use handleCallback to validate and get metadata
+    const tokens = await connector.handleCallback(apiKey, "", "");
+
+    // Store connection
+    await prisma.personalConnector.upsert({
+      where: {
+        userId_provider_customUrl: {
+          userId,
+          provider: provider.toUpperCase() as PersonalConnectorProvider,
+          customUrl: "",
+        },
+      },
+      create: {
+        userId,
+        provider: provider.toUpperCase() as PersonalConnectorProvider,
+        accessToken: encrypt(tokens.accessToken),
+        metadata: tokens.metadata as object | undefined,
+        status: "ACTIVE",
+      },
+      update: {
+        accessToken: encrypt(tokens.accessToken),
+        metadata: tokens.metadata as object | undefined,
+        status: "ACTIVE",
+        errorMessage: null,
+      },
+    });
+
+    logger.info({ userId, provider }, "API key connector connected");
+
+    res.json({
+      success: true,
+      metadata: tokens.metadata,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    logger.error({ error }, "API key connection failed");
+    res.status(400).json({ error: errorMessage });
+  }
+});
+
+// =============================================================================
 // Personal Connector Management
 // =============================================================================
 
@@ -351,6 +437,44 @@ router.get("/:provider/status", async (req, res) => {
   } catch (error) {
     logger.error({ error }, "Failed to get connector status");
     res.status(500).json({ error: "Failed to get connector status" });
+  }
+});
+
+/**
+ * POST /api/v1/connectors/:provider/refresh
+ * Refresh metadata for a personal connector (fetches latest from provider)
+ */
+router.post("/:provider/refresh", async (req, res) => {
+  try {
+    const { provider } = req.params;
+    const userId = req.headers["x-user-id"] as string;
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const refreshed = await connectorRegistry.refreshPersonalConnectionMetadata(
+      userId,
+      provider.toUpperCase() as PersonalConnectorProvider,
+    );
+
+    if (!refreshed) {
+      return res.status(404).json({
+        success: false,
+        error: "Connection not found or refresh not supported",
+      });
+    }
+
+    logger.info({ userId, provider }, "Connector metadata refreshed");
+
+    res.json({
+      success: true,
+      metadata: refreshed.metadata,
+      capabilities: refreshed.capabilities,
+    });
+  } catch (error) {
+    logger.error({ error }, "Failed to refresh connector metadata");
+    res.status(500).json({ error: "Failed to refresh connector metadata" });
   }
 });
 
@@ -519,17 +643,17 @@ router.post("/shared", async (req, res) => {
     await prisma.sharedConnector.upsert({
       where: scope.teamId
         ? {
-            teamId_connectorType: {
-              teamId: scope.teamId,
-              connectorType: body.connectorType as any,
-            },
-          }
-        : {
-            projectId_connectorType: {
-              projectId: scope.projectId!,
-              connectorType: body.connectorType as any,
-            },
+          teamId_connectorType: {
+            teamId: scope.teamId,
+            connectorType: body.connectorType as any,
           },
+        }
+        : {
+          projectId_connectorType: {
+            projectId: scope.projectId!,
+            connectorType: body.connectorType as any,
+          },
+        },
       create: {
         ...scope,
         connectorType: body.connectorType as any,
@@ -598,8 +722,6 @@ router.delete("/shared/:id", async (req, res) => {
 // =============================================================================
 
 function getRedirectUri(provider: string): string {
-  // Use webapp URL for OAuth redirects to hide the API server URL from users
-  // The webapp has a proxy route that forwards callbacks to the API
   const webappUrl =
     process.env.NEXT_PUBLIC_APP_URL ||
     process.env.WEBAPP_URL ||

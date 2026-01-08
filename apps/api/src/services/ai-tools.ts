@@ -13,7 +13,21 @@ import {
   ErrorSeverity,
   ProjectBuildStatus,
 } from "@shipper/database";
-import { transformModalUrlForDisplay } from "@shipper/shared";
+import {
+  transformModalUrlForDisplay,
+  validatePackages,
+  parseNpmOutput,
+  formatInstallError,
+  MAX_PACKAGES_PER_INSTALL,
+  checkVulnerabilities,
+  checkPackageSize,
+  checkPackageReputation,
+  formatBytes,
+  MAX_PACKAGE_SIZE,
+  MAX_TOTAL_INSTALL_SIZE,
+  type VulnerabilityResult,
+  type ReputationResult,
+} from "@shipper/shared";
 import type { ProjectErrors } from "./error-detector.js";
 import {
   getSandbox as getModalSandbox,
@@ -46,6 +60,7 @@ import { quickSyntaxCheck } from "./syntax-checker.js";
 import { ErrorDetector } from "./error-detector.js";
 import { probePreviewUrl } from "./preview-health.js";
 import { VoltAgentService } from "./voltagent-service.js";
+import { UploadService } from "./upload-service.js";
 import {
   executeShipperCloudDeploymentWithFiles,
   injectDeployKeyIntoSandbox,
@@ -59,8 +74,11 @@ import {
   generateBasicSchemaTs,
   generateConvexTsConfig,
   getRequiredPackages,
+  generateBetterAuthSchema,
+  generateBetterAuthSecret,
   // Convex API and deploy key utilities
   decryptDeployKey,
+  encryptDeployKey,
   ConvexDeploymentAPI,
 } from "@shipper/convex";
 import {
@@ -72,7 +90,14 @@ import {
   generatePaymentsTableSnippet,
   generateStripeWebhookMutations,
 } from "./stripe-toolkit.js";
+import {
+  generatePlanningQuestions,
+  refinePlanningPrompt,
+  type PlanningQuestion,
+  type PlanningAnswer,
+} from "./planning-questions-generator.js";
 import { connectorRegistry } from "./connectors/index.js";
+import { checkRateLimit, incrementRateLimit } from "./npm-rate-limiter.js";
 
 // PostHog manual capture instance
 const postHog = getPostHogCapture();
@@ -148,18 +173,27 @@ async function readFileFromSandbox(sandboxOrInfo: any, path: string) {
 }
 
 /**
- * Write file to Modal sandbox
+ * Write file to Modal sandbox and broadcast change via Ably
  */
 async function writeFileToSandbox(
   sandboxOrInfo: any,
   path: string,
   content: string,
+  projectId?: string,
 ) {
   const sandboxId = sandboxOrInfo.sandboxId || sandboxOrInfo.sandbox?.sandboxId;
   if (!sandboxId) {
     throw new Error("Modal sandbox ID not found for writing file");
   }
-  return modalWriteFile(sandboxId, path, content);
+  const result = await modalWriteFile(sandboxId, path, content);
+
+  // 🔴 ABLY: Broadcast file change to all project viewers
+  if (projectId) {
+    const { broadcastFileChanged } = await import("./ably.js");
+    broadcastFileChanged(projectId, path, "update", content).catch(() => {});
+  }
+
+  return result;
 }
 
 const CODE_FILE_REGEX = /\.(tsx?|jsx?|json|css|html)$/;
@@ -344,14 +378,14 @@ async function analyzeProjectErrors(
   const logger = getLogger(context);
   const fragmentRecord = context.currentFragmentId
     ? await prisma.v2Fragment.findUnique({
-        where: { id: context.currentFragmentId },
-        select: { id: true, files: true },
-      })
+      where: { id: context.currentFragmentId },
+      select: { id: true, files: true },
+    })
     : await prisma.v2Fragment.findFirst({
-        where: { projectId: context.projectId },
-        orderBy: { createdAt: "desc" },
-        select: { id: true, files: true },
-      });
+      where: { projectId: context.projectId },
+      orderBy: { createdAt: "desc" },
+      select: { id: true, files: true },
+    });
 
   const emptyErrors: ProjectErrors = {
     buildErrors: [],
@@ -592,12 +626,12 @@ export type MigrationAnalysis = {
   projectLanguage: "javascript" | "typescript" | "mixed"; // Detected project language
   // Detected routing library - MUST be preserved during migration
   routingLibrary:
-    | "react-router-dom"
-    | "@tanstack/react-router"
-    | "wouter"
-    | "next/router"
-    | "none"
-    | "unknown";
+  | "react-router-dom"
+  | "@tanstack/react-router"
+  | "wouter"
+  | "next/router"
+  | "none"
+  | "unknown";
   detected: {
     auth: boolean;
     database: boolean;
@@ -1397,11 +1431,11 @@ export const analyzeMigration = (context: ToolsContext) =>
             patterns: edgeFnResult.found,
             files: hasSupabaseFunctionsDir
               ? [
-                  ...edgeFnResult.files,
-                  ...filePaths.filter((f) =>
-                    f.startsWith("supabase/functions/"),
-                  ),
-                ]
+                ...edgeFnResult.files,
+                ...filePaths.filter((f) =>
+                  f.startsWith("supabase/functions/"),
+                ),
+              ]
               : edgeFnResult.files,
           };
         }
@@ -2131,13 +2165,15 @@ export const createOrEditFiles = (context: ToolsContext) =>
             `${isEdit ? "updated" : "created"} ${path}`,
           );
 
-          // Emit file creation event for live preview (only for React components)
-          // This allows the frontend to render the component in real-time
-          if (
-            path.endsWith(".tsx") &&
-            path.startsWith("src/components/") &&
-            !path.includes("/", 16) // No subdirectories under components/
-          ) {
+          // Emit file creation event for live preview
+          // Stream any React component file (.tsx/.jsx) under src/ for real-time preview
+          const isReactFile = path.endsWith(".tsx") || path.endsWith(".jsx");
+          const isUnderSrc = path.startsWith("src/");
+          const isNotTestOrConfig =
+            !path.includes(".test.") &&
+            !path.includes(".spec.") &&
+            !path.includes(".config.");
+          if (isReactFile && isUnderSrc && isNotTestOrConfig) {
             try {
               await redisFileStreamPublisher.emitFileCreation({
                 projectId: context.projectId,
@@ -2205,9 +2241,8 @@ export const createOrEditFiles = (context: ToolsContext) =>
             action: "failed",
             description,
             error: error instanceof Error ? error.message : String(error),
-            message: `Failed to process ${path}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
+            message: `Failed to process ${path}: ${error instanceof Error ? error.message : String(error)
+              }`,
           };
 
           // Track tool usage error with PostHog
@@ -2722,7 +2757,7 @@ export const finalizeWorkingFragment = (context: ToolsContext) =>
               if (!convexDeployment.setupComplete) {
                 shipperCloudErrors.push(
                   "Shipper Cloud setup is incomplete. The deployment may have been interrupted. " +
-                    "Re-run the deployToShipperCloud tool to complete setup.",
+                  "Re-run the deployToShipperCloud tool to complete setup.",
                 );
               }
 
@@ -2733,7 +2768,7 @@ export const finalizeWorkingFragment = (context: ToolsContext) =>
               ) {
                 shipperCloudErrors.push(
                   "Shipper Cloud webhook is not configured. Usage tracking and billing may not work. " +
-                    "Re-run the deployToShipperCloud tool to configure the webhook.",
+                  "Re-run the deployToShipperCloud tool to configure the webhook.",
                 );
               }
 
@@ -2759,8 +2794,8 @@ export const finalizeWorkingFragment = (context: ToolsContext) =>
                     if (matches) {
                       shipperCloudErrors.push(
                         `File "${filePath}" imports forbidden auth components from 'convex/react': ${matches.join(", ")}. ` +
-                          "These require ConvexProviderWithAuth which is NOT used by Shipper Cloud. " +
-                          "Use useSession from '@/lib/auth-client' instead.",
+                        "These require ConvexProviderWithAuth which is NOT used by Shipper Cloud. " +
+                        "Use useSession from '@/lib/auth-client' instead.",
                       );
                     }
                   }
@@ -2804,7 +2839,7 @@ export const finalizeWorkingFragment = (context: ToolsContext) =>
                     if (
                       urlMatch &&
                       urlMatch[1].trim() !==
-                        convexDeployment.convexDeploymentUrl
+                      convexDeployment.convexDeploymentUrl
                     ) {
                       needsInjection = true;
                       injectionReason = `Wrong VITE_CONVEX_URL: expected ${convexDeployment.convexDeploymentUrl}, found ${urlMatch[1].trim()}`;
@@ -2839,8 +2874,8 @@ export const finalizeWorkingFragment = (context: ToolsContext) =>
                     // Injection failed - report as error
                     shipperCloudErrors.push(
                       `Failed to auto-inject Convex credentials: ${injectionError instanceof Error ? injectionError.message : String(injectionError)}. ` +
-                        `Sandbox needs VITE_CONVEX_URL=${convexDeployment.convexDeploymentUrl}. ` +
-                        "Try restarting the sandbox or contact support.",
+                      `Sandbox needs VITE_CONVEX_URL=${convexDeployment.convexDeploymentUrl}. ` +
+                      "Try restarting the sandbox or contact support.",
                     );
                   }
                 }
@@ -3238,6 +3273,7 @@ export const createFragmentSnapshot = (context: ToolsContext) =>
 /**
  * Install npm packages in the sandbox
  * Automatically detects package manager (npm, pnpm, yarn, bun)
+ * Includes package validation to block harmful or incompatible packages
  */
 export const installPackages = (context: ToolsContext) =>
   tool({
@@ -3246,8 +3282,12 @@ export const installPackages = (context: ToolsContext) =>
     inputSchema: z.object({
       packages: z
         .array(z.string())
+        .max(
+          MAX_PACKAGES_PER_INSTALL,
+          `Cannot install more than ${MAX_PACKAGES_PER_INSTALL} packages at once`,
+        )
         .describe(
-          "Array of package names to install (e.g., ['react-router-dom', 'axios'])",
+          "Array of package names to install (e.g., ['date-fns', 'axios']). Some packages may be blocked.",
         ),
       dev: z
         .boolean()
@@ -3277,21 +3317,114 @@ export const installPackages = (context: ToolsContext) =>
           throw new Error("No packages specified for installation");
         }
 
+        // 🔒 SECURITY CHECK 1: Rate limiting
+        const rateLimitResult = await checkRateLimit(
+          context.userId,
+          context.projectId,
+        );
+        if (!rateLimitResult.allowed) {
+          const resetMinutes = Math.ceil(
+            (rateLimitResult.resetAt.getTime() - Date.now()) / 60000,
+          );
+          throw new Error(
+            `Rate limit exceeded. You can install packages again in ${resetMinutes} minute${resetMinutes !== 1 ? "s" : ""}. ` +
+              `(${rateLimitResult.limitType === "user" ? "User" : "Project"} limit: ${rateLimitResult.limit} installs per hour)`,
+          );
+        }
+
+        // 🔒 SECURITY CHECK 2: Blocklist validation
+        const validation = validatePackages(packages);
+
+        if (validation.blocked.length > 0) {
+          logger.warn({
+            msg: "Blocked packages detected",
+            blocked: validation.blocked,
+            allowed: validation.allowed,
+          });
+          throw new Error(
+            `The following packages cannot be installed: ${validation.blocked.join(", ")}. These packages are blocked because they either won't work in the sandbox environment or pose security concerns.`,
+          );
+        }
+
+        // If all packages were blocked, return early
+        if (validation.allowed.length === 0) {
+          throw new Error("No valid packages to install after filtering");
+        }
+
+        // Log warnings for flagged packages
+        if (validation.warnings.length > 0) {
+          logger.info({
+            msg: "Package warnings",
+            warnings: validation.warnings,
+          });
+        }
+
+        // 🔒 SECURITY CHECK 3: Vulnerability scanning (block CRITICAL + HIGH only)
+        const vulnerabilityResults: VulnerabilityResult[] = [];
+        for (const pkg of validation.allowed) {
+          const vulnResult = await checkVulnerabilities(pkg);
+          vulnerabilityResults.push(vulnResult);
+
+          if (vulnResult.critical > 0 || vulnResult.high > 0) {
+            logger.warn({
+              msg: "Vulnerable package detected",
+              package: pkg,
+              critical: vulnResult.critical,
+              high: vulnResult.high,
+            });
+            throw new Error(
+              `Package "${pkg}" has ${vulnResult.critical} critical and ${vulnResult.high} high severity vulnerabilities. ` +
+                `Installation blocked for security reasons. Please choose a safer alternative or use a different version.`,
+            );
+          }
+        }
+
+        // 🔒 SECURITY CHECK 4: Package size validation
+        let totalSize = 0;
+        const sizeCheckResults: Array<{ package: string; size: number }> = [];
+        for (const pkg of validation.allowed) {
+          const sizeCheck = await checkPackageSize(pkg);
+          if (!sizeCheck.allowed) {
+            throw new Error(sizeCheck.reason || `Package ${pkg} is too large`);
+          }
+          totalSize += sizeCheck.size;
+          sizeCheckResults.push({ package: pkg, size: sizeCheck.size });
+        }
+
+        if (totalSize > MAX_TOTAL_INSTALL_SIZE) {
+          throw new Error(
+            `Total installation size (${formatBytes(totalSize)}) exceeds maximum allowed (${formatBytes(MAX_TOTAL_INSTALL_SIZE)}). ` +
+              `Try installing fewer packages at once.`,
+          );
+        }
+
+        // 🔒 SECURITY CHECK 5: Reputation checking (warnings only, never block)
+        const reputationWarnings: string[] = [];
+        for (const pkg of validation.allowed) {
+          const reputation = await checkPackageReputation(pkg);
+          if (reputation.warnings.length > 0) {
+            reputationWarnings.push(
+              `${pkg}: ${reputation.warnings.join(", ")}`,
+            );
+          }
+        }
+
         // Get sandbox instance
         const sandboxInfo = await getSandbox(context.projectId);
         if (!sandboxInfo) {
           throw new Error("Sandbox not available");
         }
 
-        // Modal sandboxes only have bun installed, regardless of which lock files exist
+        // Modal sandboxes only have bun installed
         const packageManager = "bun";
-        const packagesStr = packages.join(" ");
+        const packagesToInstall = validation.allowed;
+        const packagesStr = packagesToInstall.join(" ");
         const installCommand = `bun add ${dev ? "-d" : ""} ${packagesStr}`;
 
         logger.info({
           msg: "Running install command with bun",
           command: installCommand,
-          packages,
+          packages: packagesToInstall,
           dev,
         });
 
@@ -3300,28 +3433,97 @@ export const installPackages = (context: ToolsContext) =>
           timeoutMs: 120000, // 2 minute timeout for package installation
         });
 
+        // Parse the output for errors
+        const parseResult = parseNpmOutput(
+          result.stdout || "",
+          result.stderr || "",
+        );
+
         const exitCode = result.exitCode ?? 0;
-        if (exitCode !== 0) {
-          const errorOutput =
-            result.stderr || result.stdout || "Installation failed";
-          throw new Error(errorOutput);
+        if (exitCode !== 0 && !parseResult.success) {
+          const errorMessage =
+            formatInstallError(parseResult) ||
+            result.stderr ||
+            result.stdout ||
+            "Installation failed";
+          throw new Error(errorMessage);
+        }
+
+        // Increment rate limit counter after successful installation
+        await incrementRateLimit(context.userId, context.projectId);
+
+        // Build result message
+        let message = `Successfully installed ${packagesToInstall.length} package(s) using ${packageManager}`;
+
+        // Add existing warnings to message
+        if (validation.warnings.length > 0) {
+          message += `\n\nWarnings:`;
+          for (const warning of validation.warnings) {
+            message += `\n- ${warning.package}: ${warning.message}`;
+          }
+        }
+
+        // Add reputation warnings to message
+        if (reputationWarnings.length > 0) {
+          message += `\n\nSecurity Notices:`;
+          for (const warning of reputationWarnings) {
+            message += `\n- ${warning}`;
+          }
         }
 
         const installResult = {
           success: true,
-          message: `Successfully installed ${packages.length} package(s) using ${packageManager}`,
-          packages,
+          message,
+          packages: packagesToInstall,
+          requestedPackages: packages,
+          blockedPackages: validation.blocked,
+          warnings: validation.warnings,
           dev,
           packageManager,
           stdout: result.stdout,
+          // Security check results
+          securityChecks: {
+            vulnerabilities: vulnerabilityResults,
+            packageSizes: sizeCheckResults,
+            totalSize,
+            totalSizeMB: (totalSize / (1024 * 1024)).toFixed(2),
+            reputationWarnings,
+            rateLimitRemaining: rateLimitResult.remaining,
+          },
         };
 
-        // Track tool usage with PostHog
+        // Track tool usage with PostHog (including security metrics)
         await trackToolSpan(
           "installPackages",
           context.userId,
           context.traceId || generateSpanId(),
-          { packages, dev, packageManager },
+          {
+            packages,
+            dev,
+            packageManager,
+            blockedCount: validation.blocked.length,
+            warningCount: validation.warnings.length,
+            // Security metrics
+            totalVulnerabilities: vulnerabilityResults.reduce(
+              (sum, r) => sum + r.critical + r.high + r.moderate + r.low,
+              0,
+            ),
+            criticalVulnerabilities: vulnerabilityResults.reduce(
+              (sum, r) => sum + r.critical,
+              0,
+            ),
+            highVulnerabilities: vulnerabilityResults.reduce(
+              (sum, r) => sum + r.high,
+              0,
+            ),
+            moderateVulnerabilities: vulnerabilityResults.reduce(
+              (sum, r) => sum + r.moderate,
+              0,
+            ),
+            totalSizeMB: (totalSize / (1024 * 1024)).toFixed(2),
+            reputationWarningCount: reputationWarnings.length,
+            rateLimitRemaining: rateLimitResult.remaining,
+          },
           installResult,
           {
             spanId,
@@ -3346,12 +3548,28 @@ export const installPackages = (context: ToolsContext) =>
           error: error instanceof Error ? error.message : String(error),
           packages,
         });
+
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
+        let userFriendlyMessage = `Failed to install packages: ${errorMessage}`;
+
+        // Check if this is already a user-friendly error message
+        if (
+          errorMessage.includes("cannot be installed") ||
+          errorMessage.includes("blocked") ||
+          errorMessage.includes("Rate limit exceeded") ||
+          errorMessage.includes("vulnerabilities") ||
+          errorMessage.includes("exceeds maximum")
+        ) {
+          userFriendlyMessage = errorMessage;
+        }
+
         const errorResult = {
           success: false,
           packages,
           dev,
-          error: error instanceof Error ? error.message : String(error),
-          message: `Failed to install packages: ${error instanceof Error ? error.message : String(error)}`,
+          error: errorMessage,
+          message: userFriendlyMessage,
         };
 
         // Track tool usage error with PostHog
@@ -4980,12 +5198,47 @@ export const generateImage = (context: ToolsContext) =>
               );
             }
 
+            // Sync to Media Library (R2 storage) with ai-generated tag
+            let mediaLibraryUrl: string | undefined;
+            try {
+              const uploadService = new UploadService();
+              const upload = await uploadService.uploadFromBuffer(
+                imageBuffer,
+                filenameWithExt,
+                "image/png",
+                userId,
+                {
+                  projectId,
+                  tags: ["ai-generated"],
+                  description: `AI-generated image: ${imageRequest.prompt.substring(0, 100)}${imageRequest.prompt.length > 100 ? "..." : ""}`,
+                },
+              );
+              mediaLibraryUrl = upload.url;
+              logger.info({
+                msg: "Image synced to Media Library",
+                uploadId: upload.id,
+                url: upload.url,
+                filename: filenameWithExt,
+              });
+            } catch (uploadError) {
+              // Don't fail the image generation if media library sync fails
+              logger.warn({
+                msg: "Failed to sync image to Media Library",
+                error:
+                  uploadError instanceof Error
+                    ? uploadError.message
+                    : String(uploadError),
+                filename: filenameWithExt,
+              });
+            }
+
             return {
               path: `/images/${filenameWithExt}`,
               filename: filenameWithExt,
               prompt: imageRequest.prompt,
               success: true,
               cost: imageCost,
+              mediaLibraryUrl,
             };
           } catch (error) {
             logger.error({
@@ -5542,6 +5795,163 @@ export const chat = action({
   });
 
 /**
+ * Use a personal connector that the user has already connected in Workspace Settings.
+ * Automatically injects the API key into Convex environment variables.
+ *
+ * This is the PREFERRED method for services that support personal connectors.
+ * Falls back to requestApiKeys only if the service is not connected.
+ */
+export const useConnectedService = (context: ToolsContext) =>
+  tool({
+    description: `Use a service the user has already connected in their Workspace Settings.
+
+🚀 WHEN TO USE:
+- Check CONNECTED_SERVICES in the system context FIRST
+- If the service is listed, call this tool to activate it for the project
+- This is PREFERRED over requestApiKeys for connected services like ElevenLabs
+
+✅ SUPPORTED SERVICES:
+- elevenlabs: Text-to-speech and voice AI (injects ELEVENLABS_API_KEY)
+
+WHAT THIS DOES:
+1. Retrieves the user's existing API key from secure storage
+2. Injects it into the project's Convex environment variables
+3. Returns metadata (subscription tier, limits, etc.)
+
+PREREQUISITES:
+- Shipper Cloud must be deployed first (call deployToShipperCloud)
+- The service must be connected in Workspace Settings
+
+AFTER SUCCESS:
+- Create Convex actions that use process.env.ELEVENLABS_API_KEY
+- The key is already set - no user interaction needed!
+
+IF NOT CONNECTED:
+- Returns error with connect instructions
+- Fall back to requestApiKeys if user prefers manual entry`,
+    inputSchema: z.object({
+      service: z.enum(["elevenlabs"]).describe("The connected service to use"),
+      envVarName: z
+        .string()
+        .optional()
+        .describe(
+          "Custom env var name (default: SERVICE_API_KEY, e.g., ELEVENLABS_API_KEY)",
+        ),
+    }),
+    execute: async ({ service, envVarName }) => {
+      const { projectId, userId, logger } = context;
+
+      logger?.info(
+        { service, projectId },
+        "Attempting to use connected service",
+      );
+
+      // Get the connected service access token
+      const accessToken = await connectorRegistry.getPersonalAccessToken(
+        userId,
+        service.toUpperCase() as any,
+      );
+
+      if (!accessToken) {
+        logger?.warn({ service, userId }, "Service not connected");
+        return {
+          success: false,
+          error: `${service} is not connected. The user needs to connect it in Workspace Settings first.`,
+          action_required: "connect_service",
+          fallback: `Use requestApiKeys({ provider: "${service}", envVarName: "${envVarName || service.toUpperCase() + "_API_KEY"}" }) as fallback`,
+          instructions:
+            "Ask the user to either: 1) Connect the service in Workspace Settings, or 2) Paste their API key directly via requestApiKeys",
+        };
+      }
+
+      // Get project's Convex deployment with full details
+      const project = await prisma.project.findUnique({
+        where: { id: projectId },
+        select: {
+          convexDeployment: {
+            select: {
+              convexDeploymentUrl: true,
+              deployKeyEncrypted: true,
+            },
+          },
+        },
+      });
+
+      if (
+        !project?.convexDeployment?.convexDeploymentUrl ||
+        !project?.convexDeployment?.deployKeyEncrypted
+      ) {
+        logger?.warn({ projectId }, "Shipper Cloud not deployed");
+        return {
+          success: false,
+          error:
+            "Shipper Cloud must be deployed first to use connected services.",
+          action_required: "deploy_shipper_cloud",
+          next_step:
+            "Call deployToShipperCloud tool first, then retry useConnectedService",
+        };
+      }
+
+      // Inject API key into Convex env
+      const finalEnvVarName = envVarName || `${service.toUpperCase()}_API_KEY`;
+
+      try {
+        const deployKey = decryptDeployKey(
+          project.convexDeployment.deployKeyEncrypted,
+        );
+        const convexApi = new ConvexDeploymentAPI(
+          project.convexDeployment.convexDeploymentUrl,
+          deployKey,
+        );
+
+        const result = await convexApi.setEnvironmentVariables({
+          [finalEnvVarName]: accessToken,
+        });
+
+        if (!result.success) {
+          throw new Error(result.error || "Failed to set environment variable");
+        }
+
+        logger?.info(
+          { service, projectId, envVarName: finalEnvVarName },
+          "Connected service activated",
+        );
+      } catch (error) {
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
+        logger?.error(
+          { service, error: errorMessage },
+          "Failed to set env var",
+        );
+        return {
+          success: false,
+          error: `Failed to inject ${service} API key: ${errorMessage}`,
+        };
+      }
+
+      // Get connection metadata for context
+      const connection = await connectorRegistry.getUserPersonalConnection(
+        userId,
+        service.toUpperCase() as any,
+      );
+
+      return {
+        success: true,
+        service,
+        envVarName: finalEnvVarName,
+        envVarSet: true,
+        metadata: connection?.metadata,
+        message: `${service} API key has been set as ${finalEnvVarName} in Convex environment. You can now create Convex actions that use process.env.${finalEnvVarName}`,
+        next_steps: [
+          `Create convex/${service}.ts with "use node"; at the top`,
+          `Create Convex actions that call the ${service} API using process.env.${finalEnvVarName}`,
+          "Call deployConvex() to activate the new actions",
+        ],
+      };
+    },
+  });
+
+/**
  * Request API keys from the user via a UI input card
  *
  * This tool triggers a Human-in-the-Loop flow where the frontend displays
@@ -5772,6 +6182,130 @@ FOR STRIPE - COMPLETE FLOW (FOLLOW THIS ORDER!):
       };
     },
   });
+
+// ============================================================================
+// PLANNING QUESTIONS HITL TOOL
+// ============================================================================
+// Human-in-the-loop tool for gathering user requirements before building.
+// Shows interactive questions inline in chat for the user to answer.
+
+export const ASK_CLARIFYING_QUESTIONS_TOOL_NAME = "askClarifyingQuestions";
+
+/**
+ * Ask clarifying questions to gather project requirements (HITL)
+ *
+ * This tool generates and presents clarifying questions to the user inline in the chat.
+ * The user can select from predefined options or provide custom answers.
+ *
+ * How it works (Anthropic-compatible HITL):
+ * 1. AI calls this tool with the user's initial prompt
+ * 2. Execute function generates questions and returns {status: "pending_questions", ...}
+ * 3. Frontend sees this result and shows PlanningQuestionsCard inline
+ * 4. User answers the questions
+ * 5. Frontend sends answers via addToolResult
+ * 6. AI receives answers and can then proceed with building
+ */
+export const askClarifyingQuestions = (context: ToolsContext) =>
+  tool({
+    description: `Generate 3-5 clarifying questions to understand the user's project requirements.
+
+CALL THIS TOOL EXACTLY ONCE PER CONVERSATION. Never call it again.
+
+After calling this tool:
+- Output NOTHING else - just call the tool and stop
+- Wait for user to answer in the UI
+
+When you receive the tool result back, it will contain pre-processed requirements:
+{"processed": true, "refinedPrompt": "...", "summary": "...", "keyFeatures": [...], ...}
+
+Use this refined information to immediately write a detailed implementation PLAN.
+DO NOT ask more questions - the requirements have been processed and are ready.`,
+    inputSchema: z.object({
+      prompt: z
+        .string()
+        .describe("The user's original project description or request"),
+      context: z
+        .string()
+        .optional()
+        .describe("Additional context about the conversation or project"),
+    }),
+    execute: async ({ prompt, context: additionalContext }) => {
+      const { projectId, userId, logger, traceId } = context;
+
+      logger?.info({
+        msg: "Planning HITL: Generating clarifying questions",
+        projectId,
+        promptLength: prompt.length,
+      });
+
+      try {
+        // Generate questions using the planning questions service
+        const result = await generatePlanningQuestions(prompt, userId, traceId);
+
+        logger?.info({
+          msg: "Planning HITL: Questions generated",
+          projectId,
+          sessionId: result.sessionId,
+          questionCount: result.questions.length,
+        });
+
+        // Return pending status - frontend will show the questions card
+        // IMPORTANT: The instructions field tells the AI to STOP and wait
+        return {
+          status: "pending_user_input",
+          toolName: ASK_CLARIFYING_QUESTIONS_TOOL_NAME,
+          sessionId: result.sessionId,
+          projectSummary: result.projectSummary,
+          questions: result.questions,
+          originalPrompt: prompt,
+          instructions:
+            "STOP HERE. Do not output anything else. The user is now answering the questions in the UI. You will receive their answers in a new message. Do not generate a plan yet - wait for the answers first.",
+        };
+      } catch (error) {
+        logger?.error({
+          msg: "Planning HITL: Error generating questions",
+          projectId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+
+        // Return error but still allow the conversation to continue
+        return {
+          status: "error",
+          error:
+            "Failed to generate clarifying questions. Proceeding with original prompt.",
+          originalPrompt: prompt,
+        };
+      }
+    },
+  });
+
+/**
+ * Process the user's answers to planning questions and generate refined prompt
+ * This is called internally when the user submits their answers
+ */
+export async function processPlanningAnswers(
+  originalPrompt: string,
+  projectSummary: string,
+  questions: PlanningQuestion[],
+  answers: PlanningAnswer[],
+  userId?: string,
+  traceId?: string,
+): Promise<{
+  refinedPrompt: string;
+  summary: string;
+  keyFeatures: string[];
+  targetAudience?: string;
+  designPreferences?: string;
+}> {
+  return refinePlanningPrompt(
+    originalPrompt,
+    projectSummary,
+    questions,
+    answers,
+    userId,
+    traceId,
+  );
+}
 
 /**
  * Setup Stripe payments with automatic code generation
@@ -6144,10 +6678,10 @@ WHAT THIS TOOL DOES:
           ],
           testCard: isTestMode
             ? {
-                number: "4242 4242 4242 4242",
-                expiry: "Any future date",
-                cvc: "Any 3 digits",
-              }
+              number: "4242 4242 4242 4242",
+              expiry: "Any future date",
+              cvc: "Any 3 digits",
+            }
             : null,
         };
       } catch (error) {
@@ -6622,6 +7156,285 @@ WHEN TO USE:
   });
 
 /**
+ * Migrate existing deployment to support admin API key if needed.
+ *
+ * This checks if the deployment is missing adminApiKeyEncrypted and if so:
+ * 1. Updates auth templates with apiKey plugin
+ * 2. Redeploys to Convex
+ * 3. Creates service admin user and API key
+ * 4. Saves to database
+ *
+ * @param projectId - The Shipper project ID
+ * @param sandboxId - The sandbox ID for file operations
+ * @param logger - Optional logger instance
+ */
+async function migrateAdminApiKeyIfNeeded(
+  projectId: string,
+  sandboxId: string,
+  logger?: Logger,
+): Promise<void> {
+  // Check if project has a Convex deployment that needs migration
+  const deployment = await prisma.convexDeployment.findUnique({
+    where: { projectId },
+    select: {
+      adminApiKeyEncrypted: true,
+      adminUserId: true,
+      convexDeploymentUrl: true,
+    },
+  });
+
+  // No deployment or already has admin API key - nothing to do
+  if (!deployment || deployment.adminApiKeyEncrypted) {
+    return;
+  }
+
+  logger?.info({
+    msg: "Migrating existing deployment to support admin API key",
+    projectId,
+  });
+
+  const siteUrl = deployment.convexDeploymentUrl.replace(
+    ".convex.cloud",
+    ".convex.site",
+  );
+
+  try {
+    // Step 1: Update auth templates with apiKey plugin
+    logger?.info({
+      msg: "Updating auth templates with apiKey plugin",
+      projectId,
+    });
+
+    await modalWriteFile(sandboxId, "convex/auth.ts", generateAuthTs());
+    await modalWriteFile(
+      sandboxId,
+      "convex/betterAuth/schema.ts",
+      generateBetterAuthSchema(),
+    );
+
+    // Step 2: Redeploy to Convex (already done by the main deploy, but we need
+    // to ensure the new schema is deployed if templates were just updated)
+    logger?.info({ msg: "Redeploying with updated auth templates", projectId });
+
+    await modalExecuteCommand(
+      sandboxId,
+      "rm -rf .convex node_modules/.convex convex/_generated",
+    );
+
+    const deployResult = await modalExecuteCommand(
+      sandboxId,
+      "bunx convex deploy --yes",
+      { timeoutMs: 120000 },
+    );
+
+    if (deployResult.exitCode !== 0) {
+      logger?.warn({
+        msg: "Redeploy for admin API key migration failed",
+        projectId,
+        stderr: deployResult.stderr?.slice(-500),
+      });
+      return;
+    }
+
+    // Step 3: Create service admin user and API key
+    logger?.info({ msg: "Creating service admin and API key", projectId });
+
+    // Pass existing admin info (if any) to avoid creating duplicates
+    const existingAdmin = deployment.adminApiKeyEncrypted
+      ? {
+          userId: deployment.adminUserId,
+          apiKey: decryptDeployKey(deployment.adminApiKeyEncrypted),
+        }
+      : undefined;
+
+    const adminResult = await createServiceAdminAndApiKey(
+      siteUrl,
+      logger,
+      existingAdmin,
+    );
+    logger?.info({ msg: "Admin result", projectId, adminResult });
+
+    if (!adminResult.success || !adminResult.apiKey || !adminResult.userId) {
+      logger?.warn({
+        msg: "Failed to create service admin during migration",
+        projectId,
+        error: adminResult.error,
+      });
+      return;
+    }
+
+    // Step 4: Save to database
+    const adminApiKeyEncrypted = encryptDeployKey(adminResult.apiKey);
+
+    await prisma.convexDeployment.update({
+      where: { projectId },
+      data: {
+        adminApiKeyEncrypted,
+        adminUserId: adminResult.userId,
+      },
+    });
+
+    logger?.info({
+      msg: "Admin API key migration completed successfully",
+      projectId,
+      adminUserId: adminResult.userId,
+    });
+  } catch (error) {
+    logger?.error({
+      msg: "Error during admin API key migration",
+      projectId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    // Don't throw - migration is non-fatal
+  }
+}
+
+/**
+ * Create a service admin user and generate an API key for admin operations.
+ *
+ * @param siteUrl - The Convex site URL (*.convex.site)
+ * @param logger - Optional logger instance
+ * @returns Object with success status, userId, and apiKey
+ */
+async function createServiceAdminAndApiKey(
+  siteUrl: string,
+  logger?: Logger,
+  existingAdmin?: { userId?: string | null; apiKey?: string | null },
+): Promise<{
+  success: boolean;
+  userId?: string;
+  apiKey?: string;
+  error?: string;
+}> {
+  // If admin already exists, return existing credentials
+  if (existingAdmin?.userId && existingAdmin?.apiKey) {
+    logger?.info({
+      msg: "Using existing service admin",
+      userId: existingAdmin.userId,
+    });
+    return {
+      success: true,
+      userId: existingAdmin.userId,
+      apiKey: existingAdmin.apiKey,
+    };
+  }
+
+  const serviceAdminEmail = `service-admin-${Date.now()}@shipper.internal`;
+  const serviceAdminPassword = generateBetterAuthSecret();
+
+  try {
+    // Step 1: Create the service admin user
+    logger?.info({ msg: "Creating service admin user" });
+
+    const signUpResponse = await fetch(`${siteUrl}/api/auth/sign-up/email`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: serviceAdminEmail,
+        password: serviceAdminPassword,
+        name: "Shipper Service Admin",
+      }),
+    });
+
+    if (!signUpResponse.ok) {
+      const errorData = await signUpResponse.json().catch(() => ({}));
+      const errorMessage =
+        (errorData as { message?: string }).message ||
+        `HTTP ${signUpResponse.status}`;
+      return {
+        success: false,
+        error: `Failed to create service admin: ${errorMessage}`,
+      };
+    }
+
+    const signUpResult = (await signUpResponse.json()) as {
+      user?: { id: string };
+      token?: string;
+    };
+    const userId = signUpResult.user?.id;
+
+    if (!userId) {
+      return {
+        success: false,
+        error: "Sign-up succeeded but no user ID returned",
+      };
+    }
+
+    logger?.info({ msg: "Service admin user created", userId });
+
+    // Step 2: Sign in to get session token
+    const signInResponse = await fetch(`${siteUrl}/api/auth/sign-in/email`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: serviceAdminEmail,
+        password: serviceAdminPassword,
+      }),
+    });
+
+    let sessionToken: string | undefined;
+    if (signInResponse.ok) {
+      const setCookieHeader = signInResponse.headers.get("set-cookie");
+      if (setCookieHeader) {
+        const tokenMatch = setCookieHeader.match(
+          /better-auth\.session_token=([^;]+)/,
+        );
+        sessionToken = tokenMatch?.[1];
+      }
+    }
+
+    // Step 3: Create API key
+    logger?.info({ msg: "Creating API key for service admin" });
+
+    // For server-side API key creation, always pass userId directly
+    // Don't rely on session cookies - they don't work in server-to-server calls
+    const apiKeyResponse = await fetch(`${siteUrl}/api/auth/api-key/create`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        name: "shipper-admin-key",
+        userId, // Always pass userId for server-side creation
+      }),
+    });
+
+    if (!apiKeyResponse.ok) {
+      const errorData = await apiKeyResponse.json().catch(() => ({}));
+      const errorMessage =
+        (errorData as { message?: string }).message ||
+        `HTTP ${apiKeyResponse.status}`;
+      return {
+        success: false,
+        error: `Failed to create API key: ${errorMessage}`,
+        userId,
+      };
+    }
+
+    const apiKeyResult = (await apiKeyResponse.json()) as {
+      key?: string;
+      apiKey?: string;
+    };
+    const apiKey = apiKeyResult.key || apiKeyResult.apiKey;
+
+    if (!apiKey) {
+      return {
+        success: false,
+        error: "API key creation succeeded but no key returned",
+        userId,
+      };
+    }
+
+    logger?.info({ msg: "API key created successfully" });
+
+    return { success: true, userId, apiKey };
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    return { success: false, error: errorMsg };
+  }
+}
+
+/**
  * Deploy Convex schema and functions to the PRODUCTION backend
  *
  * This tool runs `bunx convex deploy --yes` to push convex/ files
@@ -6843,6 +7656,25 @@ WHEN TO CALL:
             projectId,
             error:
               envError instanceof Error ? envError.message : String(envError),
+          });
+        }
+
+        // Check if admin API key migration is needed for existing deployments
+        // This enables Better Auth admin operations (like removeUser) via API key
+        try {
+          await migrateAdminApiKeyIfNeeded(
+            projectId,
+            sandbox.sandboxId,
+            logger,
+          );
+        } catch (migrationError) {
+          logger?.warn({
+            msg: "Admin API key migration warning (non-fatal)",
+            projectId,
+            error:
+              migrationError instanceof Error
+                ? migrationError.message
+                : String(migrationError),
           });
         }
 
@@ -7170,10 +8002,10 @@ You must pass the stripeSecretKey from the requestApiKeys result.`,
         const stripe = new Stripe(stripeSecretKey);
 
         const listParams: { limit: number; active: boolean; product?: string } =
-          {
-            limit: limit || 10,
-            active: true,
-          };
+        {
+          limit: limit || 10,
+          active: true,
+        };
         if (productId) {
           listParams.product = productId;
         }
@@ -7493,10 +8325,10 @@ The generated code follows best practices:
 
           const queries = t.userScoped
             ? [
-                `list${capitalPlural}`,
-                `getMy${capitalPlural}`,
-                `get${capitalSingular}`,
-              ]
+              `list${capitalPlural}`,
+              `getMy${capitalPlural}`,
+              `get${capitalSingular}`,
+            ]
             : [`list${capitalPlural}`, `get${capitalSingular}`];
 
           const mutations = [
@@ -8477,6 +9309,331 @@ Example: User says "check my pages" → action: "list_pages" (no query)`,
     },
   });
 
+/**
+ * Atlassian Workspace Tool - Direct REST API calls to Jira + Confluence
+ * No MCP needed - uses standard OAuth + REST API
+ */
+export const atlassianWorkspace = (context: ToolsContext) =>
+  tool({
+    description: `Interact with user's Atlassian workspace (Jira + Confluence). Direct REST API access.
+  
+  ACTIONS:
+  - list_projects: List all Jira projects
+  - search_issues: Search Jira issues by JQL query
+  - get_issue: Get specific issue details by key (e.g., "PROJ-123")
+  - search_pages: Search Confluence pages
+  - get_page: Get specific Confluence page
+  
+  IMPORTANT: Extract query from USER'S WORDS!
+  Example: User says "list my projects" → action: "list_projects"
+  Example: User says "find bug tickets" → action: "search_issues", query: "bug"`,
+
+    inputSchema: z.object({
+      action: z
+        .enum([
+          "list_projects",
+          "search_issues",
+          "get_issue",
+          "search_pages",
+          "get_page",
+        ])
+        .describe("The action to perform"),
+      query: z
+        .string()
+        .optional()
+        .describe("Search query (for search actions)"),
+      issueKey: z
+        .string()
+        .optional()
+        .describe("Issue key like 'PROJ-123' (for get_issue)"),
+      pageId: z
+        .string()
+        .optional()
+        .describe("Page ID (for get_page)"),
+      limit: z.number().optional().default(50),
+    }),
+
+    execute: async (params) => {
+      const { userId, logger } = context;
+      const { action, query, issueKey, pageId, limit } = params;
+
+      logger?.info({ msg: "Atlassian action", action, params });
+
+      // Get access token
+      const accessToken = await connectorRegistry.getPersonalAccessToken(
+        userId,
+        "ATLASSIAN" as any,
+      );
+
+      if (!accessToken) {
+        return {
+          success: false,
+          error: "Atlassian is not connected",
+          action_required: "connect_connector",
+          provider: "atlassian",
+          message:
+            "Please connect Atlassian in Settings → Connectors",
+          connectUrl: "/settings/connectors",
+        };
+      }
+
+      try {
+        // Step 1: Get accessible sites (cloud IDs)
+        const sitesResponse = await fetch(
+          "https://api.atlassian.com/oauth/token/accessible-resources",
+          {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              Accept: "application/json",
+            },
+          },
+        );
+
+        if (!sitesResponse.ok) {
+          const error = await sitesResponse.text();
+          return {
+            success: false,
+            error: `Failed to get Atlassian sites: ${error}`,
+          };
+        }
+
+        const sites = (await sitesResponse.json()) as Array<{
+          id: string;
+          url: string;
+          name: string;
+        }>;
+
+        if (sites.length === 0) {
+          return {
+            success: false,
+            error: "No accessible Atlassian sites found",
+          };
+        }
+
+        const cloudId = sites[0].id;
+        const siteName = sites[0].name;
+
+        logger?.info({
+          msg: "Using Atlassian site",
+          cloudId,
+          siteName,
+        });
+
+        // Step 2: Execute the requested action
+        let result;
+
+        switch (action) {
+          case "list_projects": {
+            // List all Jira projects
+            const response = await fetch(
+              `https://api.atlassian.com/ex/jira/${cloudId}/rest/api/3/project`,
+              {
+                headers: {
+                  Authorization: `Bearer ${accessToken}`,
+                  Accept: "application/json",
+                },
+              },
+            );
+
+            if (!response.ok) {
+              const error = await response.text();
+              return {
+                success: false,
+                error: `Failed to list projects: ${error}`,
+              };
+            }
+
+            const projects = (await response.json()) as Array<{
+              id: string;
+              key: string;
+              name: string;
+            }>;
+            result = {
+              projects,
+              count: projects.length,
+            };
+            break;
+          }
+
+          case "search_issues": {
+            // Search Jira issues
+            const jql = query
+              ? `text ~ "${query}" ORDER BY updated DESC`
+              : "ORDER BY updated DESC";
+
+            const response = await fetch(
+              `https://api.atlassian.com/ex/jira/${cloudId}/rest/api/3/search`,
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${accessToken}`,
+                  Accept: "application/json",
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  jql,
+                  maxResults: limit,
+                  fields: [
+                    "summary",
+                    "description",
+                    "status",
+                    "priority",
+                    "assignee",
+                    "created",
+                    "updated",
+                    "project",
+                  ],
+                }),
+              },
+            );
+
+            if (!response.ok) {
+              const error = await response.text();
+              return {
+                success: false,
+                error: `Failed to search issues: ${error}`,
+              };
+            }
+
+            const data = await response.json() as any;
+            result = {
+              issues: data.issues,
+              total: data.total,
+              count: data.issues.length,
+            };
+            break;
+          }
+
+          case "get_issue": {
+            if (!issueKey) {
+              return {
+                success: false,
+                error: "issueKey is required for get_issue",
+              };
+            }
+
+            const response = await fetch(
+              `https://api.atlassian.com/ex/jira/${cloudId}/rest/api/3/issue/${issueKey}`,
+              {
+                headers: {
+                  Authorization: `Bearer ${accessToken}`,
+                  Accept: "application/json",
+                },
+              },
+            );
+
+            if (!response.ok) {
+              const error = await response.text();
+              return {
+                success: false,
+                error: `Failed to get issue: ${error}`,
+              };
+            }
+
+            result = await response.json();
+            break;
+          }
+
+          case "search_pages": {
+            // Search Confluence pages
+            const cql = query
+              ? `text ~ "${query}" AND type=page ORDER BY lastmodified DESC`
+              : "type=page ORDER BY lastmodified DESC";
+
+            const urlParams = new URLSearchParams({
+              cql,
+              limit: limit.toString(),
+              expand: "body.storage,version",
+            });
+
+            const response = await fetch(
+              `https://api.atlassian.com/ex/confluence/${cloudId}/rest/api/content/search?${urlParams}`,
+              {
+                headers: {
+                  Authorization: `Bearer ${accessToken}`,
+                  Accept: "application/json",
+                },
+              },
+            );
+
+            if (!response.ok) {
+              const error = await response.text();
+              return {
+                success: false,
+                error: `Failed to search pages: ${error}`,
+              };
+            }
+
+            const data = await response.json() as any;
+            result = {
+              pages: data.results,
+              count: data.results.length,
+            };
+            break;
+          }
+
+          case "get_page": {
+            if (!pageId) {
+              return {
+                success: false,
+                error: "pageId is required for get_page",
+              };
+            }
+
+            const response = await fetch(
+              `https://api.atlassian.com/ex/confluence/${cloudId}/rest/api/content/${pageId}?expand=body.storage,version`,
+              {
+                headers: {
+                  Authorization: `Bearer ${accessToken}`,
+                  Accept: "application/json",
+                },
+              },
+            );
+
+            if (!response.ok) {
+              const error = await response.text();
+              return {
+                success: false,
+                error: `Failed to get page: ${error}`,
+              };
+            }
+
+            result = await response.json();
+            break;
+          }
+
+          default:
+            return {
+              success: false,
+              error: `Unknown action: ${action}`,
+            };
+        }
+
+        return {
+          success: true,
+          action,
+          site: siteName,
+          cloudId,
+          data: result,
+          message: `Successfully executed ${action}`,
+        };
+      } catch (error) {
+        const errorMsg =
+          error instanceof Error ? error.message : String(error);
+        logger?.error({
+          msg: "Atlassian action failed",
+          action,
+          error: errorMsg,
+        });
+
+        return {
+          success: false,
+          error: errorMsg,
+        };
+      }
+    },
+  });
+
 export const tools = (context: ToolsContext) => ({
   getFiles: getFiles(context),
   readFile: readFile(context),
@@ -8492,11 +9649,15 @@ export const tools = (context: ToolsContext) => ({
   // simpleMessage: simpleMessage(context),
   manageTodos: manageTodos(context),
   generateImage: generateImage(context),
+  // Planning questions HITL - ask clarifying questions before building
+  askClarifyingQuestions: askClarifyingQuestions(context),
   // Shipper Cloud (Convex) deployment with auth - executes immediately
   deployToShipperCloud: deployToShipperCloud(context),
   // Enable AI capabilities with Convex Agent component
   enableAI: enableAI(context),
-  // Request API keys from user via UI card (HITL)
+  // Use connected services from Workspace Settings (preferred over requestApiKeys)
+  useConnectedService: useConnectedService(context),
+  // Request API keys from user via UI card (HITL) - fallback when service not connected
   requestApiKeys: requestApiKeys(context),
   // Setup Stripe payments with automatic code generation
   setupStripePayments: setupStripePayments(context),
@@ -8521,6 +9682,9 @@ export const tools = (context: ToolsContext) => ({
   fetchFromConnector: fetchFromConnector(context),
   // Full Notion workspace capabilities (search, create, update, etc.)
   notionWorkspace: notionWorkspace(context),
+
+  // Full Atlassian workspace capabilities (Jira + Confluence)
+  atlassianWorkspace: atlassianWorkspace(context),
 });
 
 export const toolNames = Object.keys(tools({} as ToolsContext));

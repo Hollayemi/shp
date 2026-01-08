@@ -88,6 +88,75 @@ export const connectorsRouter = createTRPCRouter({
     }),
 
   /**
+   * Connect using API key (for non-OAuth providers like ElevenLabs)
+   */
+  connectWithApiKey: protectedProcedure
+    .input(
+      z.object({
+        provider: z.string(),
+        apiKey: z.string().min(1, "API key is required"),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const response = await fetch(
+        `${API_URL}/api/v1/connectors/${input.provider}/connect`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-user-id": ctx.session.user.id,
+          },
+          body: JSON.stringify({
+            apiKey: input.apiKey,
+          }),
+        },
+      );
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: error.error || "Failed to connect with API key",
+        });
+      }
+
+      const data = await response.json();
+      return { success: true, metadata: data.metadata };
+    }),
+
+  /**
+   * Refresh metadata for a connector (fetches latest from provider)
+   */
+  refreshStatus: protectedProcedure
+    .input(z.object({ provider: z.string() }))
+    .mutation(async ({ ctx, input }) => {
+      const response = await fetch(
+        `${API_URL}/api/v1/connectors/${input.provider}/refresh`,
+        {
+          method: "POST",
+          headers: {
+            "x-user-id": ctx.session.user.id,
+          },
+        },
+      );
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: error.error || "Failed to refresh status",
+        });
+      }
+
+      const data = await response.json();
+      return {
+        success: true,
+        metadata: data.metadata,
+        capabilities: data.capabilities,
+      };
+    }),
+
+  /**
    * Disconnect a provider
    */
   disconnect: protectedProcedure

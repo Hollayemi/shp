@@ -52,6 +52,7 @@ function generateCodeChallenge(verifier: string): string {
 const NOTION_CLIENT_ID = process.env.NOTION_CLIENT_ID || "";
 const NOTION_CLIENT_SECRET = process.env.NOTION_CLIENT_SECRET || "";
 // Redirect URI now goes through webapp to hide API server URL from users
+
 const NOTION_REDIRECT_URI =
   process.env.NOTION_REDIRECT_URI ||
   "http://localhost:3000/api/connectors/notion/callback";
@@ -64,6 +65,7 @@ const NOTION_MCP_SERVER_URL = "https://mcp.notion.com/mcp";
 // Key: redirectUri, Value: DCR credentials
 // This is still in-memory but keyed by redirectUri, which is consistent per deployment
 // DCR credentials are tied to the redirect URI and rarely change
+
 const dcrCredentialsCache = new Map<
   string,
   {

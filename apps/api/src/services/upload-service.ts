@@ -1,5 +1,7 @@
 import { prisma } from "@shipper/database";
 import { R2Client, type UploadType } from "./r2-client.js";
+import type { Readable } from "stream";
+import { getSandbox, writeFileBinary } from "./modal-sandbox-manager.js";
 
 // Upload configs
 const UPLOAD_CONFIGS: Record<
@@ -15,6 +17,7 @@ const UPLOAD_CONFIGS: Record<
       "image/gif",
       "image/webp",
       "image/svg+xml",
+      "image/avif",
     ],
   },
   DOCUMENT: {
@@ -107,6 +110,7 @@ export interface PresignedUploadRequest {
   size: number;
   uploadType: UploadType;
   teamId?: string;
+  projectId?: string;
   metadata?: {
     width?: number;
     height?: number;
@@ -145,6 +149,7 @@ export interface Upload {
 }
 
 export interface LibraryFilters {
+  projectId?: string;
   uploadType?: UploadType;
   tags?: string[];
   search?: string;
@@ -226,7 +231,7 @@ export class UploadService {
         height: request.metadata?.height,
         tags: request.metadata?.tags || [],
         description: request.metadata?.description,
-        usedInProjects: [],
+        usedInProjects: request.projectId ? [request.projectId] : [],
       },
     });
 
@@ -270,6 +275,38 @@ export class UploadService {
       throw new Error("File not found in storage");
     }
 
+    // Sync images to sandbox public/images folder if associated with a project
+    if (
+      upload.uploadType === "IMAGE" &&
+      upload.usedInProjects &&
+      upload.usedInProjects.length > 0
+    ) {
+      const projectId = upload.usedInProjects[0];
+      try {
+        const sandboxInfo = await getSandbox(projectId);
+        if (sandboxInfo) {
+          // Download file from R2
+          const { buffer } = await this.r2Client.getFileBuffer(
+            upload.storageKey,
+          );
+
+          // Write to sandbox's public/images folder
+          const sandboxPath = `public/images/${upload.filename}`;
+          await writeFileBinary(sandboxInfo.sandboxId, sandboxPath, buffer);
+
+          console.log(
+            `[UploadService] Synced image to sandbox: ${sandboxPath}`,
+          );
+        }
+      } catch (error) {
+        // Don't fail upload if sandbox sync fails
+        console.warn(
+          `[UploadService] Failed to sync image to sandbox:`,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+
     // Update upload record
     const updatedUpload = await prisma.upload.update({
       where: { id: request.uploadId },
@@ -292,6 +329,12 @@ export class UploadService {
       userId,
       deletedAt: null,
     };
+
+    if (filters.projectId) {
+      where.usedInProjects = {
+        has: filters.projectId,
+      };
+    }
 
     if (filters.uploadType) {
       where.uploadType = filters.uploadType;
@@ -349,6 +392,41 @@ export class UploadService {
     }
 
     return this.mapToUpload(upload);
+  }
+
+  /**
+   * Get download stream for an upload (streams from R2)
+   */
+  async getDownloadStream(
+    uploadId: string,
+    userId: string,
+  ): Promise<{
+    stream: Readable;
+    filename: string;
+    mimeType: string;
+    size?: number;
+  }> {
+    const upload = await prisma.upload.findFirst({
+      where: {
+        id: uploadId,
+        OR: [{ userId }, { team: { members: { some: { userId } } } }],
+        deletedAt: null,
+      },
+    });
+
+    if (!upload) {
+      throw new Error("Upload not found");
+    }
+
+    const file = await this.r2Client.getFileStream(upload.storageKey);
+
+    return {
+      stream: file.body,
+      filename: upload.originalName || upload.filename,
+      mimeType:
+        upload.mimeType || file.contentType || "application/octet-stream",
+      size: upload.size || file.contentLength,
+    };
   }
 
   /**
@@ -498,6 +576,65 @@ export class UploadService {
   }
 
   /**
+   * Server-side upload from buffer (for AI-generated images)
+   * Supports tags and project association
+   */
+  async uploadFromBuffer(
+    buffer: Buffer,
+    filename: string,
+    mimeType: string,
+    userId: string,
+    options?: {
+      teamId?: string;
+      projectId?: string;
+      tags?: string[];
+      description?: string;
+    },
+  ): Promise<Upload> {
+    // Auto-detect upload type
+    const uploadType = getUploadTypeFromMimeType(mimeType);
+
+    // Validate size
+    const config = UPLOAD_CONFIGS[uploadType];
+    if (buffer.length > config.maxSize) {
+      throw new Error(
+        `File size exceeds ${config.maxSize / (1024 * 1024)}MB limit`,
+      );
+    }
+
+    // Generate storage key
+    const storageKey = R2Client.generateStorageKey(
+      uploadType,
+      userId,
+      filename,
+      options?.teamId,
+    );
+
+    // Upload to R2
+    await this.r2Client.uploadFile(storageKey, buffer, mimeType);
+
+    // Create DB record
+    const upload = await prisma.upload.create({
+      data: {
+        filename,
+        originalName: filename,
+        mimeType,
+        size: buffer.length,
+        storageKey,
+        url: this.r2Client.getPublicUrl(storageKey),
+        uploadType,
+        userId,
+        teamId: options?.teamId,
+        tags: options?.tags || [],
+        description: options?.description,
+        usedInProjects: options?.projectId ? [options.projectId] : [],
+      },
+    });
+
+    return this.mapToUpload(upload);
+  }
+
+  /**
    * Map Prisma model to Upload type
    */
   private mapToUpload(upload: any): Upload {
@@ -518,5 +655,69 @@ export class UploadService {
       lastUsedAt: upload.lastUsedAt || undefined,
       createdAt: upload.createdAt,
     };
+  }
+
+  /**
+   * Sync all project-associated image uploads to the sandbox's public/images folder.
+   * This is called when the sandbox is first initialized to ensure uploaded images
+   * are available in the project.
+   */
+  async syncProjectUploadsToSandbox(
+    projectId: string,
+    sandboxId: string,
+  ): Promise<{ synced: number; failed: number }> {
+    let synced = 0;
+    let failed = 0;
+
+    try {
+      // Find all image uploads associated with this project
+      const uploads = await prisma.upload.findMany({
+        where: {
+          usedInProjects: {
+            has: projectId,
+          },
+          uploadType: "IMAGE",
+          deletedAt: null,
+        },
+        orderBy: { createdAt: "desc" },
+      });
+
+      console.log(
+        `[UploadService] Found ${uploads.length} images to sync for project ${projectId}`,
+      );
+
+      for (const upload of uploads) {
+        try {
+          // Download file from R2
+          const { buffer } = await this.r2Client.getFileBuffer(
+            upload.storageKey,
+          );
+
+          // Write to sandbox's public/images folder
+          const sandboxPath = `public/images/${upload.filename}`;
+          await writeFileBinary(sandboxId, sandboxPath, buffer);
+
+          synced++;
+          console.log(`[UploadService] Synced ${upload.filename} to sandbox`);
+        } catch (error) {
+          failed++;
+          console.warn(
+            `[UploadService] Failed to sync ${upload.filename}:`,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
+
+      console.log(
+        `[UploadService] Sync complete: ${synced} synced, ${failed} failed`,
+      );
+    } catch (error) {
+      console.error(
+        `[UploadService] Error syncing uploads to sandbox:`,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+
+    return { synced, failed };
   }
 }

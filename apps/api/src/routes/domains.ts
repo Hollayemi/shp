@@ -1,38 +1,39 @@
 /**
  * Custom Domain Management API Routes
- * 
+ *
  * Handles custom domain operations for Cloudflare for SaaS integration
  */
 
-import { Router, Request, Response } from 'express';
-import type { Router as ExpressRouter } from 'express';
-import { timingSafeEqual } from 'crypto';
-import { prisma } from '@shipper/database';
-import { createCloudflareService, CloudflareSaaSService } from '../services/cloudflare-saas.js';
-import { forceHttpsForDeployments } from '../utils/deployment-url.js';
+import { Router, Request, Response } from "express";
+import type { Router as ExpressRouter } from "express";
+import { timingSafeEqual } from "crypto";
+import { prisma } from "@shipper/database";
+import {
+  createCloudflareService,
+  CloudflareSaaSService,
+} from "../services/cloudflare-saas.js";
+import { forceHttpsForDeployments } from "../utils/deployment-url.js";
 
 const router: ExpressRouter = Router();
-
-
 
 /**
  * GET /api/domains/lookup
  * Look up a domain and return the associated project info
  * Used by Cloudflare Worker to route custom domains
  */
-router.get('/lookup', async (req: Request, res: Response) => {
+router.get("/lookup", async (req: Request, res: Response) => {
   try {
     // Validate API key from Cloudflare Worker
-    const apiKey = req.headers['x-api-key'];
+    const apiKey = req.headers["x-api-key"];
     const workerApiKey = process.env.WORKER_API_KEY;
-    
+
     if (!workerApiKey) {
       console.error("[Domains] WORKER_API_KEY not configured!");
       return res.status(500).json({ error: "Server configuration error" });
     }
 
     let isAuthorized = false;
-    if (apiKey && typeof apiKey === 'string') {
+    if (apiKey && typeof apiKey === "string") {
       const expectedKeyBuffer = Buffer.from(workerApiKey);
       const providedKeyBuffer = Buffer.from(apiKey);
       if (expectedKeyBuffer.length === providedKeyBuffer.length) {
@@ -41,13 +42,13 @@ router.get('/lookup', async (req: Request, res: Response) => {
     }
 
     if (!isAuthorized) {
-      return res.status(401).json({ error: 'Unauthorized' });
+      return res.status(401).json({ error: "Unauthorized" });
     }
 
     const { domain } = req.query;
 
-    if (!domain || typeof domain !== 'string') {
-      return res.status(400).json({ error: 'Missing domain parameter' });
+    if (!domain || typeof domain !== "string") {
+      return res.status(400).json({ error: "Missing domain parameter" });
     }
 
     // Find the custom domain that is primary and active
@@ -55,32 +56,34 @@ router.get('/lookup', async (req: Request, res: Response) => {
       where: {
         domain: domain,
         isPrimary: true,
-        status: 'ACTIVE',
+        status: "ACTIVE",
       },
       include: {
         project: {
           select: {
             id: true,
             name: true,
+            logo: true,
             deploymentUrl: true,
             paymentStatus: true,
             gracePeriodEnds: true,
+            allowRemix: true,  // For "Edit with Shipper" badge
           },
         },
       },
     });
 
     if (!customDomain) {
-      return res.status(404).json({ 
-        error: 'Domain not found or not active',
+      return res.status(404).json({
+        error: "Domain not found or not active",
         domain,
       });
     }
 
     // Ensure deployment URL is HTTPS for staging/production deployments
     const deploymentUrl = forceHttpsForDeployments(
-      customDomain.project.deploymentUrl || '', 
-      'DomainsAPI'
+      customDomain.project.deploymentUrl || "",
+      "DomainsAPI",
     );
 
     return res.json({
@@ -89,14 +92,16 @@ router.get('/lookup', async (req: Request, res: Response) => {
       project: {
         id: customDomain.project.id,
         name: customDomain.project.name,
+        logo: customDomain.project.logo || '🚀',
         deploymentUrl: deploymentUrl,
         paymentStatus: customDomain.project.paymentStatus,
         gracePeriodEnds: customDomain.project.gracePeriodEnds,
+        allowRemix: customDomain.project.allowRemix ?? false,
       },
     });
   } catch (error) {
-    console.error('[Domains] Error looking up domain:', error);
-    return res.status(500).json({ error: 'Failed to lookup domain' });
+    console.error("[Domains] Error looking up domain:", error);
+    return res.status(500).json({ error: "Failed to lookup domain" });
   }
 });
 
@@ -104,19 +109,19 @@ router.get('/lookup', async (req: Request, res: Response) => {
  * GET /api/domains/metadata/:projectId
  * Get metadata for a deployed project (used by domain router for meta tags)
  */
-router.get('/metadata/:projectId', async (req: Request, res: Response) => {
+router.get("/metadata/:projectId", async (req: Request, res: Response) => {
   try {
     // Validate API key from Cloudflare Worker
-    const apiKey = req.headers['x-api-key'];
+    const apiKey = req.headers["x-api-key"];
     const workerApiKey = process.env.WORKER_API_KEY;
-    
+
     if (!workerApiKey) {
       console.error("[Domains] WORKER_API_KEY not configured!");
       return res.status(500).json({ error: "Server configuration error" });
     }
 
     let isAuthorized = false;
-    if (apiKey && typeof apiKey === 'string') {
+    if (apiKey && typeof apiKey === "string") {
       const expectedKeyBuffer = Buffer.from(workerApiKey);
       const providedKeyBuffer = Buffer.from(apiKey);
       if (expectedKeyBuffer.length === providedKeyBuffer.length) {
@@ -125,13 +130,13 @@ router.get('/metadata/:projectId', async (req: Request, res: Response) => {
     }
 
     if (!isAuthorized) {
-      return res.status(401).json({ error: 'Unauthorized' });
+      return res.status(401).json({ error: "Unauthorized" });
     }
 
     const { projectId } = req.params;
 
     if (!projectId) {
-      return res.status(400).json({ error: 'Missing projectId parameter' });
+      return res.status(400).json({ error: "Missing projectId parameter" });
     }
 
     // Get project with metadata from the latest fragment
@@ -141,34 +146,41 @@ router.get('/metadata/:projectId', async (req: Request, res: Response) => {
         id: true,
         name: true,
         subtitle: true,
+        logo: true,
         deploymentUrl: true,
         sandboxId: true,
         daytonaSandboxId: true,
         sandboxProvider: true,
+        allowRemix: true,  // For "Edit with Shipper" badge
       },
     });
 
     if (!project) {
-      return res.status(404).json({ 
-        error: 'Project not found',
+      return res.status(404).json({
+        error: "Project not found",
         projectId,
       });
     }
 
     // Default fallback metadata
-    let title = project.name || 'Shipper App';
-    let description = project.subtitle || `${project.name} - Built with Shipper`;
+    let title = project.name || "Shipper App";
+    let description =
+      project.subtitle || `${project.name} - Built with Shipper`;
     let iconUrl: string | null = null;
     let shareImageUrl: string | null = null;
 
     // Try to get dynamic metadata from sandbox if available (Modal only for now)
-    const provider = (project.sandboxProvider as "modal" | "daytona" | null) || "modal";
-    const sandboxId = provider === "modal" ? project.sandboxId : project.daytonaSandboxId;
+    const provider =
+      (project.sandboxProvider as "modal" | "daytona" | null) || "modal";
+    const sandboxId =
+      provider === "modal" ? project.sandboxId : project.daytonaSandboxId;
 
     if (sandboxId && provider === "modal") {
       try {
         // Import Modal sandbox manager
-        const { readFile } = await import("../services/modal-sandbox-manager.js");
+        const { readFile } = await import(
+          "../services/modal-sandbox-manager.js"
+        );
 
         // Read index.html from sandbox
         const htmlContent = await readFile(sandboxId, "index.html");
@@ -195,7 +207,6 @@ router.get('/metadata/:projectId', async (req: Request, res: Response) => {
 
         // For now, we don't extract icon/image data URLs in the API app
         // The web app metadata route can handle that with its API clients
-        
       } catch (error) {
         console.warn("[Domains] Failed to read metadata from sandbox:", error);
         // Continue with fallback metadata
@@ -220,12 +231,17 @@ router.get('/metadata/:projectId', async (req: Request, res: Response) => {
         twitterDescription: description,
         twitterImage: shareImageUrl,
       },
+      // "Edit with Shipper" badge info
+      remixInfo: {
+        allowRemix: project.allowRemix ?? false,
+        projectLogo: project.logo || '🚀',
+      },
     };
 
     return res.json(response);
   } catch (error) {
-    console.error('[Domains] Error fetching project metadata:', error);
-    return res.status(500).json({ error: 'Failed to fetch project metadata' });
+    console.error("[Domains] Error fetching project metadata:", error);
+    return res.status(500).json({ error: "Failed to fetch project metadata" });
   }
 });
 
@@ -233,35 +249,50 @@ router.get('/metadata/:projectId', async (req: Request, res: Response) => {
  * POST /api/domains
  * Create a new custom domain for a project
  */
-router.post('/', async (req: Request, res: Response) => {
+router.post("/", async (req: Request, res: Response) => {
   try {
     const { projectId, domain } = req.body;
 
     if (!projectId || !domain) {
-      return res.status(400).json({ error: 'Missing required fields: projectId, domain' });
+      return res
+        .status(400)
+        .json({ error: "Missing required fields: projectId, domain" });
     }
 
     // Validate domain format
     if (!CloudflareSaaSService.isValidDomain(domain)) {
-      return res.status(400).json({ error: 'Invalid domain format' });
+      return res.status(400).json({ error: "Invalid domain format" });
     }
 
     // Check for prohibited domains (Cloudflare restrictions)
-    const prohibitedDomains = ['example.com', 'example.net', 'example.org', 'test.com', 'localhost'];
+    const prohibitedDomains = [
+      "example.com",
+      "example.net",
+      "example.org",
+      "test.com",
+      "localhost",
+    ];
     const domainLower = domain.toLowerCase();
-    
+
     for (const prohibited of prohibitedDomains) {
-      if (domainLower === prohibited || domainLower.endsWith(`.${prohibited}`)) {
-        return res.status(400).json({ 
-          error: `Domain "${domain}" is not allowed. Please use a real domain you own.` 
+      if (
+        domainLower === prohibited ||
+        domainLower.endsWith(`.${prohibited}`)
+      ) {
+        return res.status(400).json({
+          error: `Domain "${domain}" is not allowed. Please use a real domain you own.`,
         });
       }
     }
 
     // Check for localhost or IP addresses
-    if (domainLower.includes('localhost') || /^\d+\.\d+\.\d+\.\d+$/.test(domain)) {
-      return res.status(400).json({ 
-        error: 'Cannot use localhost or IP addresses. Please use a real domain name.' 
+    if (
+      domainLower.includes("localhost") ||
+      /^\d+\.\d+\.\d+\.\d+$/.test(domain)
+    ) {
+      return res.status(400).json({
+        error:
+          "Cannot use localhost or IP addresses. Please use a real domain name.",
       });
     }
 
@@ -271,7 +302,7 @@ router.post('/', async (req: Request, res: Response) => {
     });
 
     if (!project) {
-      return res.status(404).json({ error: 'Project not found' });
+      return res.status(404).json({ error: "Project not found" });
     }
 
     // Check if domain already exists
@@ -280,39 +311,50 @@ router.post('/', async (req: Request, res: Response) => {
     });
 
     if (existingDomain) {
-      return res.status(409).json({ error: 'Domain already in use' });
+      return res.status(409).json({ error: "Domain already in use" });
     }
 
     // Create custom hostname in Cloudflare
     let cfHostname: any;
-    
+
     try {
       const cloudflare = createCloudflareService();
       cfHostname = await cloudflare.createCustomHostname(domain, projectId);
     } catch (cloudflareError: any) {
-      console.error('[Domains] Cloudflare API error:', cloudflareError);
-      
+      console.error("[Domains] Cloudflare API error:", cloudflareError);
+
       // Parse Cloudflare error messages
-      let errorMessage = 'Failed to create custom domain';
-      
+      let errorMessage = "Failed to create custom domain";
+
       if (cloudflareError.message) {
         const msg = cloudflareError.message.toLowerCase();
-        
-        if (msg.includes('example.com') || msg.includes('example.net') || msg.includes('example.org')) {
-          errorMessage = 'Cannot use example domains. Please use a real domain you own.';
-        } else if (msg.includes('already exists') || msg.includes('duplicate')) {
-          errorMessage = 'This domain is already registered with Cloudflare.';
-        } else if (msg.includes('invalid') || msg.includes('malformed')) {
-          errorMessage = 'Invalid domain format. Please check your domain name.';
-        } else if (msg.includes('rate limit')) {
-          errorMessage = 'Too many requests. Please try again in a few minutes.';
-        } else if (msg.includes('unauthorized') || msg.includes('forbidden')) {
-          errorMessage = 'Cloudflare authentication error. Please contact support.';
+
+        if (
+          msg.includes("example.com") ||
+          msg.includes("example.net") ||
+          msg.includes("example.org")
+        ) {
+          errorMessage =
+            "Cannot use example domains. Please use a real domain you own.";
+        } else if (
+          msg.includes("already exists") ||
+          msg.includes("duplicate")
+        ) {
+          errorMessage = "This domain is already registered with Cloudflare.";
+        } else if (msg.includes("invalid") || msg.includes("malformed")) {
+          errorMessage =
+            "Invalid domain format. Please check your domain name.";
+        } else if (msg.includes("rate limit")) {
+          errorMessage =
+            "Too many requests. Please try again in a few minutes.";
+        } else if (msg.includes("unauthorized") || msg.includes("forbidden")) {
+          errorMessage =
+            "Cloudflare authentication error. Please contact support.";
         } else {
           errorMessage = cloudflareError.message;
         }
       }
-      
+
       return res.status(400).json({ error: errorMessage });
     }
 
@@ -321,20 +363,29 @@ router.post('/', async (req: Request, res: Response) => {
     let txtValue: string | undefined;
 
     // Check ownership_verification first (for ownership verification)
-    if (cfHostname.ownership_verification?.name && cfHostname.ownership_verification?.value) {
+    if (
+      cfHostname.ownership_verification?.name &&
+      cfHostname.ownership_verification?.value
+    ) {
       txtName = cfHostname.ownership_verification.name;
       txtValue = cfHostname.ownership_verification.value;
     }
     // Check ssl.validation_records for TXT records (for SSL validation)
-    else if (cfHostname.ssl.validation_records && cfHostname.ssl.validation_records.length > 0) {
-      const txtRecord = cfHostname.ssl.validation_records.find((r: { txt_name?: string; txt_value?: string }) => r.txt_name && r.txt_value);
+    else if (
+      cfHostname.ssl.validation_records &&
+      cfHostname.ssl.validation_records.length > 0
+    ) {
+      const txtRecord = cfHostname.ssl.validation_records.find(
+        (r: { txt_name?: string; txt_value?: string }) =>
+          r.txt_name && r.txt_value,
+      );
       if (txtRecord) {
         txtName = txtRecord.txt_name;
         txtValue = txtRecord.txt_value;
       }
     }
 
-    console.log('[Domains] Cloudflare response:', {
+    console.log("[Domains] Cloudflare response:", {
       hostname: cfHostname.hostname,
       status: cfHostname.status,
       sslStatus: cfHostname.ssl.status,
@@ -361,7 +412,9 @@ router.post('/', async (req: Request, res: Response) => {
       },
     });
 
-    console.log(`[Domains] Created custom domain ${domain} for project ${projectId}`);
+    console.log(
+      `[Domains] Created custom domain ${domain} for project ${projectId}`,
+    );
 
     return res.status(201).json({
       success: true,
@@ -379,9 +432,12 @@ router.post('/', async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
-    console.error('[Domains] Error creating custom domain:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    return res.status(500).json({ error: `Failed to create custom domain: ${errorMessage}` });
+    console.error("[Domains] Error creating custom domain:", error);
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    return res
+      .status(500)
+      .json({ error: `Failed to create custom domain: ${errorMessage}` });
   }
 });
 
@@ -389,7 +445,7 @@ router.post('/', async (req: Request, res: Response) => {
  * GET /api/domains/:projectId
  * List all custom domains for a project
  */
-router.get('/:projectId', async (req: Request, res: Response) => {
+router.get("/:projectId", async (req: Request, res: Response) => {
   try {
     const { projectId } = req.params;
 
@@ -399,18 +455,18 @@ router.get('/:projectId', async (req: Request, res: Response) => {
     });
 
     if (!project) {
-      return res.status(404).json({ error: 'Project not found' });
+      return res.status(404).json({ error: "Project not found" });
     }
 
     // Get all domains for this project
     const domains = await prisma.customDomain.findMany({
       where: { projectId },
-      orderBy: { createdAt: 'desc' },
+      orderBy: { createdAt: "desc" },
     });
 
     return res.json({
       success: true,
-      domains: domains.map(d => ({
+      domains: domains.map((d) => ({
         id: d.id,
         domain: d.domain,
         status: d.status,
@@ -426,8 +482,8 @@ router.get('/:projectId', async (req: Request, res: Response) => {
       })),
     });
   } catch (error) {
-    console.error('[Domains] Error listing domains:', error);
-    return res.status(500).json({ error: 'Failed to list domains' });
+    console.error("[Domains] Error listing domains:", error);
+    return res.status(500).json({ error: "Failed to list domains" });
   }
 });
 
@@ -435,7 +491,7 @@ router.get('/:projectId', async (req: Request, res: Response) => {
  * GET /api/domains/status/:domainId
  * Check verification status of a domain
  */
-router.get('/status/:domainId', async (req: Request, res: Response) => {
+router.get("/status/:domainId", async (req: Request, res: Response) => {
   try {
     const { domainId } = req.params;
 
@@ -445,33 +501,43 @@ router.get('/status/:domainId', async (req: Request, res: Response) => {
     });
 
     if (!domain) {
-      return res.status(404).json({ error: 'Domain not found' });
+      return res.status(404).json({ error: "Domain not found" });
     }
 
     // Check status with Cloudflare
     if (domain.cloudflareHostnameId) {
       const cloudflare = createCloudflareService();
-      const cfHostname = await cloudflare.getCustomHostname(domain.cloudflareHostnameId);
+      const cfHostname = await cloudflare.getCustomHostname(
+        domain.cloudflareHostnameId,
+      );
 
       // Extract TXT records from SSL validation records or ownership verification
       let txtName: string | undefined = domain.txtName || undefined;
       let txtValue: string | undefined = domain.txtValue || undefined;
 
       // Check ownership_verification first (for ownership verification)
-      if (cfHostname.ownership_verification?.name && cfHostname.ownership_verification?.value) {
+      if (
+        cfHostname.ownership_verification?.name &&
+        cfHostname.ownership_verification?.value
+      ) {
         txtName = cfHostname.ownership_verification.name;
         txtValue = cfHostname.ownership_verification.value;
       }
       // Check ssl.validation_records for TXT records (for SSL validation)
-      else if (cfHostname.ssl.validation_records && cfHostname.ssl.validation_records.length > 0) {
-        const txtRecord = cfHostname.ssl.validation_records.find(r => r.txt_name && r.txt_value);
+      else if (
+        cfHostname.ssl.validation_records &&
+        cfHostname.ssl.validation_records.length > 0
+      ) {
+        const txtRecord = cfHostname.ssl.validation_records.find(
+          (r) => r.txt_name && r.txt_value,
+        );
         if (txtRecord) {
           txtName = txtRecord.txt_name;
           txtValue = txtRecord.txt_value;
         }
       }
 
-      console.log('[Domains] Status check - Cloudflare response:', {
+      console.log("[Domains] Status check - Cloudflare response:", {
         hostname: cfHostname.hostname,
         status: cfHostname.status,
         sslStatus: cfHostname.ssl.status,
@@ -492,7 +558,10 @@ router.get('/status/:domainId', async (req: Request, res: Response) => {
           txtValue: txtValue,
           verificationErrors: cfHostname.verification_errors || [],
           lastCheckedAt: new Date(),
-          verifiedAt: cfHostname.status === 'active' && !domain.verifiedAt ? new Date() : domain.verifiedAt,
+          verifiedAt:
+            cfHostname.status === "active" && !domain.verifiedAt
+              ? new Date()
+              : domain.verifiedAt,
         },
       });
 
@@ -531,8 +600,8 @@ router.get('/status/:domainId', async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
-    console.error('[Domains] Error checking domain status:', error);
-    return res.status(500).json({ error: 'Failed to check domain status' });
+    console.error("[Domains] Error checking domain status:", error);
+    return res.status(500).json({ error: "Failed to check domain status" });
   }
 });
 
@@ -540,7 +609,7 @@ router.get('/status/:domainId', async (req: Request, res: Response) => {
  * POST /api/domains/:domainId/set-primary
  * Set a domain as the primary domain for the project
  */
-router.post('/:domainId/set-primary', async (req: Request, res: Response) => {
+router.post("/:domainId/set-primary", async (req: Request, res: Response) => {
   try {
     const { domainId } = req.params;
 
@@ -550,19 +619,20 @@ router.post('/:domainId/set-primary', async (req: Request, res: Response) => {
     });
 
     if (!domain) {
-      return res.status(404).json({ error: 'Domain not found' });
+      return res.status(404).json({ error: "Domain not found" });
     }
 
     // Only allow setting active domains as primary
-    if (domain.status !== 'ACTIVE') {
-      return res.status(400).json({ 
-        error: 'Only verified domains can be set as primary. Please wait for domain verification.' 
+    if (domain.status !== "ACTIVE") {
+      return res.status(400).json({
+        error:
+          "Only verified domains can be set as primary. Please wait for domain verification.",
       });
     }
 
     // Unset any existing primary domain for this project
     await prisma.customDomain.updateMany({
-      where: { 
+      where: {
         projectId: domain.projectId,
         isPrimary: true,
       },
@@ -575,7 +645,9 @@ router.post('/:domainId/set-primary', async (req: Request, res: Response) => {
       data: { isPrimary: true },
     });
 
-    console.log(`[Domains] Set ${domain.domain} as primary for project ${domain.projectId}`);
+    console.log(
+      `[Domains] Set ${domain.domain} as primary for project ${domain.projectId}`,
+    );
 
     return res.json({
       success: true,
@@ -586,8 +658,8 @@ router.post('/:domainId/set-primary', async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
-    console.error('[Domains] Error setting primary domain:', error);
-    return res.status(500).json({ error: 'Failed to set primary domain' });
+    console.error("[Domains] Error setting primary domain:", error);
+    return res.status(500).json({ error: "Failed to set primary domain" });
   }
 });
 
@@ -595,25 +667,25 @@ router.post('/:domainId/set-primary', async (req: Request, res: Response) => {
  * POST /api/domains/cleanup
  * Clean up orphaned domain records (admin only)
  */
-router.post('/cleanup', async (req: Request, res: Response) => {
+router.post("/cleanup", async (req: Request, res: Response) => {
   try {
     // Validate API key
-    const apiKey = req.headers['x-api-key'];
+    const apiKey = req.headers["x-api-key"];
     if (!apiKey || apiKey !== process.env.SHIPPER_API_KEY) {
-      return res.status(401).json({ error: 'Unauthorized' });
+      return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const { fullDomainCleanup } = await import('../utils/domain-cleanup.js');
+    const { fullDomainCleanup } = await import("../utils/domain-cleanup.js");
     const result = await fullDomainCleanup();
 
     return res.json({
       success: true,
-      message: 'Domain cleanup completed',
+      message: "Domain cleanup completed",
       result,
     });
   } catch (error) {
-    console.error('[Domains] Error during cleanup:', error);
-    return res.status(500).json({ error: 'Failed to cleanup domains' });
+    console.error("[Domains] Error during cleanup:", error);
+    return res.status(500).json({ error: "Failed to cleanup domains" });
   }
 });
 
@@ -621,42 +693,48 @@ router.post('/cleanup', async (req: Request, res: Response) => {
  * POST /api/domains/unset-primary/:projectId
  * Unset all primary domains for a project (revert to Shipper subdomain)
  */
-router.post('/unset-primary/:projectId', async (req: Request, res: Response) => {
-  try {
-    // Validate API key
-    const apiKey = req.headers['x-api-key'];
-    if (!apiKey || apiKey !== process.env.SHIPPER_API_KEY) {
-      return res.status(401).json({ error: 'Unauthorized' });
+router.post(
+  "/unset-primary/:projectId",
+  async (req: Request, res: Response) => {
+    try {
+      // Validate API key
+      const apiKey = req.headers["x-api-key"];
+      if (!apiKey || apiKey !== process.env.SHIPPER_API_KEY) {
+        return res.status(401).json({ error: "Unauthorized" });
+      }
+
+      const { projectId } = req.params;
+
+      // Unset all primary domains for this project
+      await prisma.customDomain.updateMany({
+        where: {
+          projectId,
+          isPrimary: true,
+        },
+        data: { isPrimary: false },
+      });
+
+      console.log(
+        `[Domains] Unset all primary domains for project ${projectId}`,
+      );
+
+      return res.json({
+        success: true,
+        message:
+          "All custom domains unset as primary. Shipper subdomain is now primary.",
+      });
+    } catch (error) {
+      console.error("[Domains] Error unsetting primary domain:", error);
+      return res.status(500).json({ error: "Failed to unset primary domain" });
     }
-
-    const { projectId } = req.params;
-
-    // Unset all primary domains for this project
-    await prisma.customDomain.updateMany({
-      where: { 
-        projectId,
-        isPrimary: true,
-      },
-      data: { isPrimary: false },
-    });
-
-    console.log(`[Domains] Unset all primary domains for project ${projectId}`);
-
-    return res.json({
-      success: true,
-      message: 'All custom domains unset as primary. Shipper subdomain is now primary.',
-    });
-  } catch (error) {
-    console.error('[Domains] Error unsetting primary domain:', error);
-    return res.status(500).json({ error: 'Failed to unset primary domain' });
-  }
-});
+  },
+);
 
 /**
  * DELETE /api/domains/:domainId
  * Remove a custom domain
  */
-router.delete('/:domainId', async (req: Request, res: Response) => {
+router.delete("/:domainId", async (req: Request, res: Response) => {
   try {
     const { domainId } = req.params;
 
@@ -666,27 +744,37 @@ router.delete('/:domainId', async (req: Request, res: Response) => {
     });
 
     if (!domain) {
-      return res.status(404).json({ error: 'Domain not found' });
+      return res.status(404).json({ error: "Domain not found" });
     }
 
     // Delete from Cloudflare first (fail fast if this fails)
     if (domain.cloudflareHostnameId) {
       try {
-        console.log(`[Domains] Deleting from Cloudflare: ${domain.domain} (${domain.cloudflareHostnameId})`);
+        console.log(
+          `[Domains] Deleting from Cloudflare: ${domain.domain} (${domain.cloudflareHostnameId})`,
+        );
         const cloudflare = createCloudflareService();
         await cloudflare.deleteCustomHostname(domain.cloudflareHostnameId);
-        console.log(`[Domains] Successfully deleted from Cloudflare: ${domain.domain}`);
+        console.log(
+          `[Domains] Successfully deleted from Cloudflare: ${domain.domain}`,
+        );
       } catch (error) {
-        console.error(`[Domains] CRITICAL: Failed to delete ${domain.domain} from Cloudflare:`, error);
-        
+        console.error(
+          `[Domains] CRITICAL: Failed to delete ${domain.domain} from Cloudflare:`,
+          error,
+        );
+
         // Return error instead of continuing - this prevents orphaned records
-        return res.status(500).json({ 
-          error: `Failed to delete domain from Cloudflare: ${error instanceof Error ? error.message : 'Unknown error'}`,
-          details: 'Domain deletion aborted to prevent orphaned records. Please try again or contact support.'
+        return res.status(500).json({
+          error: `Failed to delete domain from Cloudflare: ${error instanceof Error ? error.message : "Unknown error"}`,
+          details:
+            "Domain deletion aborted to prevent orphaned records. Please try again or contact support.",
         });
       }
     } else {
-      console.log(`[Domains] No Cloudflare hostname ID for ${domain.domain}, skipping Cloudflare deletion`);
+      console.log(
+        `[Domains] No Cloudflare hostname ID for ${domain.domain}, skipping Cloudflare deletion`,
+      );
     }
 
     // Only delete from database if Cloudflare deletion succeeded
@@ -694,15 +782,45 @@ router.delete('/:domainId', async (req: Request, res: Response) => {
       where: { id: domainId },
     });
 
-    console.log(`[Domains] Successfully deleted custom domain ${domain.domain} from both Cloudflare and database`);
+    console.log(
+      `[Domains] Successfully deleted custom domain ${domain.domain} from both Cloudflare and database`,
+    );
 
     return res.json({
       success: true,
-      message: 'Domain deleted successfully',
+      message: "Domain deleted successfully",
     });
   } catch (error) {
-    console.error('[Domains] Error deleting domain:', error);
-    return res.status(500).json({ error: 'Failed to delete domain' });
+    console.error("[Domains] Error deleting domain:", error);
+    return res.status(500).json({ error: "Failed to delete domain" });
+  }
+});
+
+/**
+ * GET /api/v1/domains/demo-mode
+ * Check if demo mode is enabled (i.e., Cloudflare credentials are not configured)
+ * This endpoint doesn't require authentication as it's just checking a config flag
+ */
+router.get("/demo-mode", async (_req: Request, res: Response) => {
+  try {
+    const apiToken = process.env.CLOUDFLARE_API_TOKEN;
+    const zoneId = process.env.CLOUDFLARE_ZONE_ID;
+    const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+
+    // Demo mode is enabled if any Cloudflare credentials are missing
+    const isDemoMode = !apiToken || !zoneId || !accountId;
+
+    return res.json({
+      success: true,
+      demoMode: isDemoMode,
+    });
+  } catch (error) {
+    console.error("[Domains] Error checking demo mode:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to check demo mode",
+      demoMode: true, // Default to demo mode on error
+    });
   }
 });
 

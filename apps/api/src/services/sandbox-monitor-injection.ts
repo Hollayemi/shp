@@ -9,14 +9,15 @@ import type { Sandbox } from "@daytonaio/sdk";
 import { readFileFromSandbox, writeFileToSandbox } from "./sandbox-compat.js";
 import { generateMonitorScript, MONITOR_CONFIG } from "@shipper/shared";
 
-// Cache the monitoring script content
-let MONITOR_SCRIPT_CONTENT: string | null = null;
-
+// Generate monitor script content on each call (no caching to ensure latest version)
+// Construct allowed origins at runtime (not build time) to support Vercel preview URLs
 function getMonitorScriptContent(): string {
-  if (!MONITOR_SCRIPT_CONTENT) {
-    MONITOR_SCRIPT_CONTENT = generateMonitorScript(MONITOR_CONFIG.ALLOWED_ORIGINS);
-  }
-  return MONITOR_SCRIPT_CONTENT;
+  const allowedOrigins = [
+    process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000",
+    "https://app.shipper.now",
+    "https://staging.shipper.now",
+  ];
+  return generateMonitorScript(allowedOrigins);
 }
 
 /**

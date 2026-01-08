@@ -1,12 +1,10 @@
 /**
  * Cloud Credit Manager Service
  *
- * Manages Shipper Cloud credits for teams.
+ * Manages Shipper Cloud credits for teams/workspaces.
  *
- * Note: The current database schema stores cloud credits at the user level,
- * not the team level. This service uses the team owner's credits as the
- * team's credit balance. A future migration should add team-level cloud
- * credit fields for proper team billing.
+ * 🏢 WORKSPACE-CENTRIC: All operations use team.cloudCreditBalance directly.
+ * This is the source of truth for cloud credits.
  *
  * 1 credit = 1 cent ($0.01)
  */
@@ -29,62 +27,38 @@ interface TransactionRecord {
   createdAt: Date;
 }
 
-/**
- * Get the team owner's user ID for credit operations
- */
-async function getTeamOwnerId(teamId: string): Promise<string | null> {
-  const owner = await prisma.teamMember.findFirst({
-    where: {
-      teamId,
-      role: "OWNER",
-    },
-    select: { userId: true },
-  });
-
-  return owner?.userId ?? null;
-}
-
 export const CloudCreditManager = {
   /**
-   * Get cloud credit balance for a team
-   * Uses the team owner's cloud credit balance
+   * Get cloud credit balance for a team/workspace
+   * 🏢 WORKSPACE-CENTRIC: Uses team.cloudCreditBalance directly
    */
   async getBalance(teamId: string): Promise<number> {
-    const ownerId = await getTeamOwnerId(teamId);
-
-    if (!ownerId) {
-      logger.warn({ teamId }, "No team owner found for credit balance lookup");
-      return 0;
-    }
-
-    const user = await prisma.user.findUnique({
-      where: { id: ownerId },
+    const team = await prisma.team.findUnique({
+      where: { id: teamId },
       select: { cloudCreditBalance: true },
     });
 
-    return user?.cloudCreditBalance ?? 0;
+    if (!team) {
+      logger.warn({ teamId }, "Team not found for credit balance lookup");
+      return 0;
+    }
+
+    return team.cloudCreditBalance ?? 0;
   },
 
   /**
-   * Get transaction history for a team
-   * Uses the team owner's transaction history
+   * Get transaction history for a team/workspace
+   * 🏢 WORKSPACE-CENTRIC: Queries by teamId
    */
   async getTransactionHistory(
     teamId: string,
-    options: TransactionHistoryOptions = {}
+    options: TransactionHistoryOptions = {},
   ): Promise<TransactionRecord[]> {
     const { limit = 50, offset = 0, type } = options;
 
-    const ownerId = await getTeamOwnerId(teamId);
-
-    if (!ownerId) {
-      logger.warn({ teamId }, "No team owner found for transaction history");
-      return [];
-    }
-
     const transactions = await prisma.cloudCreditTransaction.findMany({
       where: {
-        userId: ownerId,
+        teamId,
         ...(type ? { type } : {}),
       },
       orderBy: { createdAt: "desc" },
@@ -105,19 +79,24 @@ export const CloudCreditManager = {
 
   /**
    * Add credits to a team's balance
-   * Adds credits to the team owner's account
+   * 🏢 WORKSPACE-CENTRIC: Adds to team.cloudCreditBalance
    */
   async addCredits(
     teamId: string,
     amount: number,
     type: "TOP_UP" | "PROMOTIONAL" | "REFUND" | "AUTO_TOP_UP",
     description: string,
-    metadata?: Record<string, unknown>
+    metadata?: Record<string, unknown>,
+    userId?: string,
   ): Promise<{ success: boolean; newBalance: number }> {
-    const ownerId = await getTeamOwnerId(teamId);
+    // Verify team exists
+    const team = await prisma.team.findUnique({
+      where: { id: teamId },
+      select: { id: true },
+    });
 
-    if (!ownerId) {
-      throw new Error(`No team owner found for team ${teamId}`);
+    if (!team) {
+      throw new Error(`Team not found: ${teamId}`);
     }
 
     // Convert credits: $1 = 100 credits (1 credit = 1 cent)
@@ -135,10 +114,11 @@ export const CloudCreditManager = {
 
     // Use a transaction to ensure atomicity
     const result = await prisma.$transaction(async (tx) => {
-      // Create transaction record
+      // Create transaction record (linked to team)
       await tx.cloudCreditTransaction.create({
         data: {
-          userId: ownerId,
+          teamId,
+          userId, // Track who triggered the addition (optional)
           amount: credits,
           type: creditType,
           description,
@@ -146,22 +126,22 @@ export const CloudCreditManager = {
         },
       });
 
-      // Update user balance
-      const updatedUser = await tx.user.update({
-        where: { id: ownerId },
+      // Update team balance
+      const updatedTeam = await tx.team.update({
+        where: { id: teamId },
         data: {
           cloudCreditBalance: { increment: credits },
         },
         select: { cloudCreditBalance: true },
       });
 
-      return updatedUser.cloudCreditBalance;
+      return updatedTeam.cloudCreditBalance;
     });
 
     logger.info({
-      msg: "Cloud credits added to team",
+      msg: "Cloud credits added to workspace",
       teamId,
-      ownerId,
+      userId,
       amountUSD: amount,
       credits,
       type: creditType,
@@ -173,27 +153,31 @@ export const CloudCreditManager = {
 
   /**
    * Deduct credits from a team's balance
-   * Deducts from the team owner's account
+   * 🏢 WORKSPACE-CENTRIC: Deducts from team.cloudCreditBalance
+   * @param teamId - The workspace/team ID
+   * @param credits - Amount of credits to deduct
+   * @param description - Description of the transaction
+   * @param userId - Optional user ID who triggered this deduction (for per-user tracking)
+   * @param metadata - Optional metadata
    */
   async deductCredits(
     teamId: string,
     credits: number,
     description: string,
-    metadata?: Record<string, unknown>
+    userId?: string,
+    metadata?: Record<string, unknown>,
   ): Promise<{ success: boolean; newBalance: number }> {
-    const ownerId = await getTeamOwnerId(teamId);
-
-    if (!ownerId) {
-      throw new Error(`No team owner found for team ${teamId}`);
-    }
-
-    // Check balance first
-    const user = await prisma.user.findUnique({
-      where: { id: ownerId },
+    // Check team exists and has sufficient balance
+    const team = await prisma.team.findUnique({
+      where: { id: teamId },
       select: { cloudCreditBalance: true },
     });
 
-    if (!user || user.cloudCreditBalance < credits) {
+    if (!team) {
+      throw new Error(`Team not found: ${teamId}`);
+    }
+
+    if ((team.cloudCreditBalance ?? 0) < credits) {
       throw new Error("Insufficient cloud credits");
     }
 
@@ -202,7 +186,8 @@ export const CloudCreditManager = {
       // Create transaction record (negative amount for deduction)
       await tx.cloudCreditTransaction.create({
         data: {
-          userId: ownerId,
+          teamId,
+          userId, // Track who triggered the deduction
           amount: -credits,
           type: "USAGE",
           description,
@@ -210,9 +195,9 @@ export const CloudCreditManager = {
         },
       });
 
-      // Update user balance
-      const updatedUser = await tx.user.update({
-        where: { id: ownerId },
+      // Update team balance
+      const updatedTeam = await tx.team.update({
+        where: { id: teamId },
         data: {
           cloudCreditBalance: { decrement: credits },
           cloudLifetimeCreditsUsed: { increment: credits },
@@ -220,13 +205,13 @@ export const CloudCreditManager = {
         select: { cloudCreditBalance: true },
       });
 
-      return updatedUser.cloudCreditBalance;
+      return updatedTeam.cloudCreditBalance;
     });
 
     logger.info({
-      msg: "Cloud credits deducted from team",
+      msg: "Cloud credits deducted from workspace",
       teamId,
-      ownerId,
+      userId,
       credits,
       newBalance: result,
     });

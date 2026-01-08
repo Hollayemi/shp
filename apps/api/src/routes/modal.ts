@@ -14,6 +14,7 @@ import {
   restoreFilesById,
   executeCommand,
   readFile,
+  readFileBase64,
   writeFile,
   listFiles,
   findFiles,
@@ -22,6 +23,7 @@ import {
   deleteSnapshot,
   deploySandboxApp,
   startDevServer,
+  patchViteConfigForImport,
 } from "../services/modal-sandbox-manager.js";
 import {
   ensureSandboxRecovered,
@@ -48,6 +50,7 @@ const restoreFragmentSchema = z.object({
 const restoreFilesSchema = z.object({
   sandboxId: z.string(),
   files: z.record(z.string(), z.string()),
+  projectId: z.string().optional(), // Optional: enables AI-generated image restoration from Media Library
 });
 
 const executeCommandSchema = z.object({
@@ -325,7 +328,7 @@ router.post("/sandbox", async (req: Request, res: Response) => {
       importedFrom,
     } = validatedData;
 
-    console.log(validatedData)
+    console.log(validatedData);
 
     req.logger?.info({
       msg: "Creating Modal sandbox",
@@ -452,16 +455,17 @@ router.post("/fragment/restore", async (req: Request, res: Response) => {
 router.post("/files/restore", async (req: Request, res: Response) => {
   try {
     const validatedData = restoreFilesSchema.parse(req.body);
-    const { sandboxId, files } = validatedData;
+    const { sandboxId, files, projectId } = validatedData;
 
     const fileCount = Object.keys(files).length;
     req.logger?.info({
       msg: "Restoring files in Modal sandbox",
       sandboxId,
       fileCount,
+      hasProjectId: !!projectId,
     });
 
-    await restoreFilesById(sandboxId, files);
+    await restoreFilesById(sandboxId, files, req.logger, projectId);
 
     req.logger?.info({
       msg: "Files restored successfully",
@@ -557,6 +561,42 @@ router.post("/file/read", async (req: Request, res: Response) => {
   } catch (error) {
     req.logger?.error({
       msg: "Error reading file",
+      error: error instanceof Error ? error.message : "Unknown error",
+    });
+    const response: ApiResponse = {
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error",
+    };
+    res.status(500).json(response);
+  }
+});
+
+/**
+ * POST /api/v1/modal/file/read-base64
+ * Read a binary file from the sandbox as base64
+ */
+router.post("/file/read-base64", async (req: Request, res: Response) => {
+  try {
+    const validatedData = fileReadSchema.parse(req.body);
+    const { sandboxId, path } = validatedData;
+
+    req.logger?.info({
+      msg: "Reading binary file from Modal sandbox as base64",
+      sandboxId,
+      path,
+    });
+
+    const result = await readFileBase64(sandboxId, path);
+
+    const response: ApiResponse = {
+      success: true,
+      data: result,
+    };
+
+    res.json(response);
+  } catch (error) {
+    req.logger?.error({
+      msg: "Error reading binary file",
       error: error instanceof Error ? error.message : "Unknown error",
     });
     const response: ApiResponse = {
@@ -1288,5 +1328,41 @@ router.get(
     }
   },
 );
+
+// Patch vite.config to add Shipper IDs plugin
+const patchViteConfigSchema = z.object({
+  projectId: z.string(),
+});
+
+router.post("/vite-config/patch", async (req: Request, res: Response) => {
+  try {
+    const body = patchViteConfigSchema.parse(req.body);
+    const { projectId } = body;
+
+    // Get sandbox for the project
+    const sandboxInfo = await getSandbox(projectId);
+    if (!sandboxInfo || !sandboxInfo.sandbox) {
+      return res.status(404).json({
+        success: false,
+        error: "Sandbox not found",
+      } as ApiResponse);
+    }
+
+    // Patch vite.config
+    await patchViteConfigForImport(sandboxInfo.sandbox);
+
+    return res.json({
+      success: true,
+      message: "Vite config patched successfully",
+    } as ApiResponse);
+  } catch (error) {
+    console.error("[patchViteConfig] Error:", error);
+    return res.status(500).json({
+      success: false,
+      error:
+        error instanceof Error ? error.message : "Failed to patch vite.config",
+    } as ApiResponse);
+  }
+});
 
 export default router;

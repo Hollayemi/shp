@@ -19,6 +19,9 @@ import type {
 // Environment variables
 const ATLASSIAN_CLIENT_ID = "";
 const ATLASSIAN_CLIENT_SECRET = "";
+const REDIRECT_URI = "http://localhost:3000/api/connectors/atlassian/callback";
+
+console.log("Atlassian Connector - Client ID:", ATLASSIAN_CLIENT_ID ? "Loaded" : "Missing");
 
 if (!ATLASSIAN_CLIENT_ID || !ATLASSIAN_CLIENT_SECRET) {
     throw new Error(
@@ -67,17 +70,12 @@ export const atlassianConnector: PersonalConnectorDefinition = {
                 "read:confluence-space.summary",
                 "offline_access",
             ].join(" "),
-            redirect_uri: "http://localhost:4000/api/connectors/atlassian/callback",
+            redirect_uri: REDIRECT_URI,
             state,
             response_type: "code",
             prompt: "consent",
         });
-        console.log("[Atlassian OAuth] redirect_uri:", redirectUri);
-        logger.info({
-            msg: "[Atlassian OAuth] redirect_uri:" + redirectUri,
-            service: "---",
-        });
-
+       
         return `https://auth.atlassian.com/authorize?${params.toString()}`;
     },
 
@@ -98,7 +96,7 @@ export const atlassianConnector: PersonalConnectorDefinition = {
                 client_id: ATLASSIAN_CLIENT_ID,
                 client_secret: ATLASSIAN_CLIENT_SECRET,
                 code,
-                redirect_uri: redirectUri,
+                redirect_uri: REDIRECT_URI,
             }),
         });
 

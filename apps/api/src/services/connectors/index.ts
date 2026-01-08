@@ -41,6 +41,13 @@ connectorRegistry.registerPersonal(notionConnector);
 
 import { linearConnector } from "./personal/linear.js";
 connectorRegistry.registerPersonal(linearConnector);
+// Import and register elevenlabs connector if available
+// Note: This file may not exist in main branch - if import fails, module will still export connectorRegistry
+import { elevenlabsConnector } from "./personal/elevenlabs.js";
+connectorRegistry.registerPersonal(elevenlabsConnector);
+
+// import { linearConnector } from "./personal/linear.js";
+// connectorRegistry.registerPersonal(linearConnector);
 
 import { atlassianConnector } from "./personal/atlassian.js";
 connectorRegistry.registerPersonal(atlassianConnector);

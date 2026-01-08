@@ -86,6 +86,12 @@ export interface PersonalConnectorDefinition {
 
   // Optional: Check if connection is still valid
   validateConnection?(accessToken: string): Promise<boolean>;
+
+  // Optional: Refresh metadata from the service (e.g., get updated plan info)
+  refreshMetadata?(accessToken: string): Promise<{
+    metadata: Record<string, unknown>;
+    capabilities?: Record<string, unknown>;
+  } | null>;
 }
 
 // ============================================================================

@@ -19,6 +19,7 @@ import { getSnapshotImageId, hasSnapshot } from "./modal-snapshots.js";
 import {
   generateMonitorScript,
   MONITOR_CONFIG,
+  MONITOR_SCRIPT_VERSION,
   createViteDevServerCommand,
   getViteDevServerCommandDescription,
 } from "@shipper/shared";
@@ -32,6 +33,7 @@ import {
   SHIPPER_IDS_PLUGIN_CANONICAL,
   SHIPPER_IDS_PLUGIN_CANONICAL_JS,
 } from "./shipper-ids-plugin-canonical.js";
+import { R2Client } from "./r2-client.js";
 
 /**
  * Transform Modal preview URLs (CURRENTLY DISABLED - returns original URLs)
@@ -149,8 +151,134 @@ type ModalExecutionResult = {
 };
 
 /**
+ * Sync shipper-ids plugin if version differs from server
+ * Detects project type and writes the appropriate plugin file
+ */
+async function syncShipperIdsPlugin(
+  sandbox: Sandbox,
+  logger: Logger,
+): Promise<void> {
+  // Detect project type by checking if vite.config.js exists (JS config = JS project)
+  let isJavaScriptOnly = false;
+  try {
+    const viteJsCheck = await sandbox.exec([
+      "test",
+      "-f",
+      "/workspace/vite.config.js",
+    ]);
+    isJavaScriptOnly = (await viteJsCheck.wait()) === 0;
+  } catch {
+    isJavaScriptOnly = false;
+  }
+
+  const SHIPPER_IDS_PLUGIN_PATH = isJavaScriptOnly
+    ? "plugins/vite-plugin-shipper-ids.js"
+    : "plugins/vite-plugin-shipper-ids.ts";
+  const pluginContent = isJavaScriptOnly
+    ? SHIPPER_IDS_PLUGIN_CANONICAL_JS
+    : SHIPPER_IDS_PLUGIN_CANONICAL;
+
+  try {
+    let sandboxPluginVersion: string | null = null;
+    let hasOldTsPlugin = false;
+
+    // For JS-only projects, check if there's an old .ts plugin that needs to be removed
+    if (isJavaScriptOnly) {
+      try {
+        const oldTsCheck = await sandbox.exec([
+          "test",
+          "-f",
+          "/workspace/plugins/vite-plugin-shipper-ids.ts",
+        ]);
+        hasOldTsPlugin = (await oldTsCheck.wait()) === 0;
+      } catch {
+        // Ignore errors checking for old file
+      }
+    }
+
+    try {
+      const pluginFile = await sandbox.open(
+        `/workspace/${SHIPPER_IDS_PLUGIN_PATH}`,
+        "r",
+      );
+      const existingContent = new TextDecoder().decode(
+        await pluginFile.read(),
+      );
+      await pluginFile.close();
+      const versionMatch = existingContent.match(
+        /SHIPPER_IDS_PLUGIN_VERSION\s*=\s*["']([^"']+)["']/,
+      );
+      sandboxPluginVersion = versionMatch?.[1] ?? null;
+    } catch {
+      // Plugin file doesn't exist or is unreadable
+      sandboxPluginVersion = null;
+    }
+
+    logger.info({
+      msg: "Checking shipper-ids plugin version",
+      sandboxVersion: sandboxPluginVersion,
+      serverVersion: SHIPPER_IDS_PLUGIN_VERSION,
+      pluginPath: SHIPPER_IDS_PLUGIN_PATH,
+      isJavaScriptOnly,
+      hasOldTsPlugin,
+    });
+
+    // Sync if version mismatch OR if Base44 has old .ts plugin that needs removal
+    if (
+      sandboxPluginVersion !== SHIPPER_IDS_PLUGIN_VERSION ||
+      hasOldTsPlugin
+    ) {
+      logger.info({
+        msg: "Plugin version mismatch, syncing canonical plugin",
+        sandboxVersion: sandboxPluginVersion,
+        serverVersion: SHIPPER_IDS_PLUGIN_VERSION,
+        pluginPath: SHIPPER_IDS_PLUGIN_PATH,
+      });
+
+      // Ensure plugins directory exists
+      await sandbox.exec(["mkdir", "-p", "/workspace/plugins"]);
+
+      // For JS-only projects, remove any existing .ts plugin file
+      if (isJavaScriptOnly) {
+        await sandbox.exec([
+          "rm",
+          "-f",
+          "/workspace/plugins/vite-plugin-shipper-ids.ts",
+        ]);
+      }
+
+      // Write canonical plugin (JS for Base44, TS for others)
+      const pluginFile = await sandbox.open(
+        `/workspace/${SHIPPER_IDS_PLUGIN_PATH}`,
+        "w",
+      );
+      await pluginFile.write(new TextEncoder().encode(pluginContent));
+      await pluginFile.close();
+
+      logger.info({
+        msg: "Successfully synced shipper-ids plugin",
+        version: SHIPPER_IDS_PLUGIN_VERSION,
+        pluginPath: SHIPPER_IDS_PLUGIN_PATH,
+      });
+    } else {
+      logger.info({ msg: "Plugin version matches, no sync needed" });
+    }
+  } catch (pluginSyncError) {
+    logger.warn({
+      msg: "Failed to sync shipper-ids plugin",
+      error:
+        pluginSyncError instanceof Error
+          ? pluginSyncError.message
+          : String(pluginSyncError),
+    });
+    // Don't throw - sandbox can still work without this plugin
+  }
+}
+
+/**
  * Inject monitoring script into Modal sandbox's index.html
  * Creates a .shipper directory with the monitoring script and imports it
+ * Uses version checking to auto-update when the script changes
  */
 async function setupModalSandboxMonitoring(
   sandbox: Sandbox,
@@ -162,6 +290,7 @@ async function setupModalSandboxMonitoring(
     msg: "Setting up monitoring for sandbox",
     sandboxId,
     projectId,
+    serverVersion: MONITOR_SCRIPT_VERSION,
   });
 
   try {
@@ -169,38 +298,70 @@ async function setupModalSandboxMonitoring(
     logger.info("Waiting 2 seconds for dev server to generate index.html");
     await new Promise((resolve) => setTimeout(resolve, 2000));
 
-    // 1. Create .shipper directory with monitoring script
-    logger.info({
-      msg: "Generating monitor script content",
-      sandboxId,
-    });
-    const monitorScriptContent = generateMonitorScript(
-      MONITOR_CONFIG.ALLOWED_ORIGINS,
-    );
-
     // Create .shipper directory first
     logger.info("Creating /workspace/.shipper directory");
     await sandbox.exec(["mkdir", "-p", "/workspace/.shipper"]);
 
-    // Write monitoring script to .shipper/monitor.js
-    logger.info("Writing monitor script to /workspace/.shipper/monitor.js");
-    const monitorFile = await sandbox.open(
-      "/workspace/.shipper/monitor.js",
-      "w",
-    );
-    logger.info({
-      msg: "Writing monitor script content",
-      bytes: monitorScriptContent.length,
-    });
-    await monitorFile.write(new TextEncoder().encode(monitorScriptContent));
-    await monitorFile.close();
+    // 1. Check existing monitor.js version
+    let existingVersion: string | null = null;
+    try {
+      const existingFile = await sandbox.open(
+        "/workspace/.shipper/monitor.js",
+        "r",
+      );
+      const existingContent = new TextDecoder().decode(
+        await existingFile.read(),
+      );
+      await existingFile.close();
+
+      // Extract version from the comment at the top: // shipper-monitor-version: X.X.X
+      const versionMatch = existingContent.match(
+        /shipper-monitor-version:\s*([^\s\n]+)/,
+      );
+      existingVersion = versionMatch?.[1] ?? null;
+    } catch {
+      // File doesn't exist, will create it
+      existingVersion = null;
+    }
 
     logger.info({
-      msg: "Created .shipper/monitor.js",
-      sandboxId,
+      msg: "Checking monitor script version",
+      sandboxVersion: existingVersion,
+      serverVersion: MONITOR_SCRIPT_VERSION,
     });
 
-    // 2. Read the current index.html
+    // 2. Write monitor script if version mismatch or doesn't exist
+    if (existingVersion !== MONITOR_SCRIPT_VERSION) {
+      logger.info({
+        msg: "Monitor version mismatch, updating script",
+        sandboxVersion: existingVersion,
+        serverVersion: MONITOR_SCRIPT_VERSION,
+      });
+
+      const monitorScriptContent = generateMonitorScript(
+        MONITOR_CONFIG.ALLOWED_ORIGINS,
+      );
+
+      const monitorFile = await sandbox.open(
+        "/workspace/.shipper/monitor.js",
+        "w",
+      );
+      await monitorFile.write(new TextEncoder().encode(monitorScriptContent));
+      await monitorFile.close();
+
+      logger.info({
+        msg: "Updated .shipper/monitor.js",
+        version: MONITOR_SCRIPT_VERSION,
+        bytes: monitorScriptContent.length,
+      });
+    } else {
+      logger.info({
+        msg: "Monitor script version matches, no update needed",
+        version: MONITOR_SCRIPT_VERSION,
+      });
+    }
+
+    // 3. Read the current index.html to check for import tag
     let htmlContent: string;
     try {
       logger.info("Opening /workspace/index.html for reading");
@@ -220,14 +381,14 @@ async function setupModalSandboxMonitoring(
       return; // Non-critical, continue without monitoring
     }
 
-    // 3. Check if monitoring script is already injected
+    // 4. Check if monitoring script import is already present
     if (htmlContent.includes(".shipper/monitor.js")) {
-      logger.info("Monitoring script already present in index.html");
+      logger.info("Monitoring script import already present in index.html");
       return;
     }
 
-    // 4. Inject the script import tag
-    logger.info("Preparing to inject monitoring script");
+    // 5. Inject the script import tag
+    logger.info("Preparing to inject monitoring script import");
     const scriptTag =
       '<script type="module" src="/.shipper/monitor.js"></script>';
     let modifiedHtml = htmlContent;
@@ -256,17 +417,17 @@ async function setupModalSandboxMonitoring(
     }
 
     logger.info({
-      msg: "Script injected, writing back to file",
+      msg: "Script import injected, writing back to file",
       injectionLocation,
     });
 
-    // 5. Write the modified HTML back to the sandbox
+    // 6. Write the modified HTML back to the sandbox
     const modifiedFile = await sandbox.open("/workspace/index.html", "w");
     await modifiedFile.write(new TextEncoder().encode(modifiedHtml));
     await modifiedFile.close();
 
     logger.info({
-      msg: "Successfully injected monitoring script into index.html",
+      msg: "Successfully injected monitoring script import into index.html",
       injectionLocation,
     });
   } catch (error) {
@@ -331,74 +492,8 @@ export async function getSandbox(
         });
         const sandbox = await modalClient.sandboxes.fromId(project.sandboxId);
 
-        // For JS-only projects, ensure we have the JS plugin (not TS) to avoid TypeScript detection
-        // Detect by checking if vite.config.js exists (JS config = JS project)
-        let isJavaScriptOnly = false;
-        try {
-          const viteJsCheck = await sandbox.exec([
-            "test",
-            "-f",
-            "/workspace/vite.config.js",
-          ]);
-          isJavaScriptOnly = (await viteJsCheck.wait()) === 0;
-        } catch {
-          isJavaScriptOnly = false;
-        }
-
-        projectLogger.info({
-          msg: "Checking project type for plugin sync",
-          importedFrom,
-          isJavaScriptOnly,
-        });
-
-        if (isJavaScriptOnly) {
-          try {
-            // Check if old .ts plugin exists
-            const oldTsCheck = await sandbox.exec([
-              "test",
-              "-f",
-              "/workspace/plugins/vite-plugin-shipper-ids.ts",
-            ]);
-            const hasOldTsPlugin = (await oldTsCheck.wait()) === 0;
-
-            if (hasOldTsPlugin) {
-              projectLogger.info({
-                msg: "Found old .ts plugin in JS-only sandbox, replacing with .js version",
-              });
-
-              // Remove old .ts plugin and vite.config.ts
-              await sandbox.exec([
-                "rm",
-                "-f",
-                "/workspace/plugins/vite-plugin-shipper-ids.ts",
-                "/workspace/vite.config.ts",
-              ]);
-
-              // Write new .js plugin
-              await sandbox.exec(["mkdir", "-p", "/workspace/plugins"]);
-              const pluginFile = await sandbox.open(
-                "/workspace/plugins/vite-plugin-shipper-ids.js",
-                "w",
-              );
-              await pluginFile.write(
-                new TextEncoder().encode(SHIPPER_IDS_PLUGIN_CANONICAL_JS),
-              );
-              await pluginFile.close();
-
-              projectLogger.info({
-                msg: "Successfully replaced .ts plugin with .js for JS-only project",
-              });
-            }
-          } catch (pluginError) {
-            projectLogger.warn({
-              msg: "Failed to check/replace plugin for JS-only project",
-              error:
-                pluginError instanceof Error
-                  ? pluginError.message
-                  : String(pluginError),
-            });
-          }
-        }
+        // Sync shipper-ids plugin if version differs from server
+        await syncShipperIdsPlugin(sandbox, projectLogger);
 
         // Transform URL if it exists
         let transformedUrl = project.sandboxUrl;
@@ -901,146 +996,7 @@ export async function createSandbox(
     }
 
     // Sync shipper-ids plugin if version differs from server
-    // Use .js extension for JS-only projects, .ts for TypeScript projects
-    // Detect by checking if vite.config.js exists (JS config = JS project)
-    let isJavaScriptOnly = false;
-    try {
-      const viteJsCheck = await sandbox.exec([
-        "test",
-        "-f",
-        "/workspace/vite.config.js",
-      ]);
-      isJavaScriptOnly = (await viteJsCheck.wait()) === 0;
-      projectLogger.info({
-        msg: "Detected project type by checking for vite.config.js",
-        isJavaScriptOnly,
-      });
-    } catch (detectError) {
-      // If detection fails, assume TypeScript project
-      isJavaScriptOnly = false;
-      projectLogger.warn({
-        msg: "Failed to detect project type, assuming TypeScript",
-        error:
-          detectError instanceof Error
-            ? detectError.message
-            : String(detectError),
-      });
-    }
-
-    const SHIPPER_IDS_PLUGIN_PATH = isJavaScriptOnly
-      ? "plugins/vite-plugin-shipper-ids.js"
-      : "plugins/vite-plugin-shipper-ids.ts";
-    const pluginContent = isJavaScriptOnly
-      ? SHIPPER_IDS_PLUGIN_CANONICAL_JS
-      : SHIPPER_IDS_PLUGIN_CANONICAL;
-
-    try {
-      let sandboxPluginVersion: string | null = null;
-      let hasOldTsPlugin = false;
-
-      // For JS-only projects, check if there's an old .ts plugin that needs to be removed
-      if (isJavaScriptOnly) {
-        try {
-          const oldTsCheck = await sandbox.exec([
-            "test",
-            "-f",
-            "/workspace/plugins/vite-plugin-shipper-ids.ts",
-          ]);
-          hasOldTsPlugin = (await oldTsCheck.wait()) === 0;
-          if (hasOldTsPlugin) {
-            projectLogger.info({
-              msg: "Found old .ts plugin file for Base44 project, will remove and replace with .js",
-            });
-          }
-        } catch {
-          // Ignore errors checking for old file
-        }
-      }
-
-      try {
-        const pluginFile = await sandbox.open(
-          `/workspace/${SHIPPER_IDS_PLUGIN_PATH}`,
-          "r",
-        );
-        const existingContent = new TextDecoder().decode(
-          await pluginFile.read(),
-        );
-        await pluginFile.close();
-        const versionMatch = existingContent.match(
-          /SHIPPER_IDS_PLUGIN_VERSION\s*=\s*["']([^"']+)["']/,
-        );
-        sandboxPluginVersion = versionMatch?.[1] ?? null;
-      } catch (error) {
-        // Plugin file doesn't exist or is unreadable
-        projectLogger.debug({
-          msg: "Could not read existing shipper-ids plugin version, assuming it needs to be created",
-          error: error instanceof Error ? error.message : String(error),
-        });
-        sandboxPluginVersion = null;
-      }
-
-      projectLogger.info({
-        msg: "Checking shipper-ids plugin version",
-        sandboxVersion: sandboxPluginVersion,
-        serverVersion: SHIPPER_IDS_PLUGIN_VERSION,
-        pluginPath: SHIPPER_IDS_PLUGIN_PATH,
-        isJavaScriptOnly,
-        hasOldTsPlugin,
-      });
-
-      // Sync if version mismatch OR if Base44 has old .ts plugin that needs removal
-      if (
-        sandboxPluginVersion !== SHIPPER_IDS_PLUGIN_VERSION ||
-        hasOldTsPlugin
-      ) {
-        projectLogger.info({
-          msg: "Plugin version mismatch, syncing canonical plugin",
-          sandboxVersion: sandboxPluginVersion,
-          serverVersion: SHIPPER_IDS_PLUGIN_VERSION,
-          pluginPath: SHIPPER_IDS_PLUGIN_PATH,
-        });
-
-        // Ensure plugins directory exists
-        await sandbox.exec(["mkdir", "-p", "/workspace/plugins"]);
-
-        // For JS-only projects, remove any existing .ts plugin file to avoid TypeScript detection
-        if (isJavaScriptOnly) {
-          await sandbox.exec([
-            "rm",
-            "-f",
-            "/workspace/plugins/vite-plugin-shipper-ids.ts",
-          ]);
-          projectLogger.info({
-            msg: "Removed old .ts plugin file for Base44 project",
-          });
-        }
-
-        // Write canonical plugin (JS for Base44, TS for others)
-        const pluginFile = await sandbox.open(
-          `/workspace/${SHIPPER_IDS_PLUGIN_PATH}`,
-          "w",
-        );
-        await pluginFile.write(new TextEncoder().encode(pluginContent));
-        await pluginFile.close();
-
-        projectLogger.info({
-          msg: "Successfully synced shipper-ids plugin",
-          version: SHIPPER_IDS_PLUGIN_VERSION,
-          pluginPath: SHIPPER_IDS_PLUGIN_PATH,
-        });
-      } else {
-        projectLogger.info({ msg: "Plugin version matches, no sync needed" });
-      }
-    } catch (pluginSyncError) {
-      projectLogger.warn({
-        msg: "Failed to sync shipper-ids plugin",
-        error:
-          pluginSyncError instanceof Error
-            ? pluginSyncError.message
-            : String(pluginSyncError),
-      });
-      // Don't throw - sandbox can still work without this plugin
-    }
+    await syncShipperIdsPlugin(sandbox, projectLogger);
 
     // Patch vite.config ONLY for imported projects to add shipper-ids plugin
     // Normal projects already have this in their template
@@ -1247,6 +1203,25 @@ export async function createSandbox(
             maxWaitTime,
           });
         }
+
+        // Set up monitoring after dev server is ready
+        // Run in background - don't block sandbox creation
+        if (isReady) {
+          setupModalSandboxMonitoring(
+            sandbox,
+            sandbox.sandboxId,
+            projectId,
+            projectLogger,
+          ).catch((monitorError) => {
+            projectLogger.warn({
+              msg: "Monitoring setup failed (non-critical)",
+              error:
+                monitorError instanceof Error
+                  ? monitorError.message
+                  : String(monitorError),
+            });
+          });
+        }
       } catch (devServerError) {
         projectLogger.warn({
           msg: "Dev server start warning (may still be running)",
@@ -1337,6 +1312,92 @@ export async function deleteSandbox(
   }
 }
 
+// Regex pattern to detect binary image file placeholders
+const BINARY_IMAGE_PLACEHOLDER_REGEX = /^\[Binary image file: (.+)\]$/;
+
+/**
+ * Fetch AI-generated images from Media Library (R2 storage) for restoration
+ * 
+ * When AI generates images, they are:
+ * 1. Saved to the sandbox at /workspace/images/{filename}
+ * 2. Synced to R2 Media Library with "ai-generated" tag
+ * 3. Stored as placeholder `[Binary image file: {filename}]` in fragment (to avoid DB bloat)
+ * 
+ * This function retrieves the actual image data from R2 when restoring a sandbox.
+ */
+async function fetchAIGeneratedImageFromMediaLibrary(
+  projectId: string,
+  filename: string,
+  logger: Logger,
+): Promise<Buffer | null> {
+  try {
+    // Find the upload record in the database with matching filename and ai-generated tag
+    // Note: Upload model uses usedInProjects array instead of direct projectId
+    const upload = await prisma.upload.findFirst({
+      where: {
+        usedInProjects: {
+          has: projectId,
+        },
+        tags: {
+          has: "ai-generated",
+        },
+        OR: [
+          { filename: filename },
+          { originalName: filename },
+          // Also match by filename without extension
+          { filename: { contains: filename.replace(/\.[^.]+$/, "") } },
+        ],
+      },
+      orderBy: {
+        createdAt: "desc", // Get the most recent matching image
+      },
+      select: {
+        id: true,
+        storageKey: true,
+        filename: true,
+        url: true,
+      },
+    });
+
+    if (!upload) {
+      logger.debug({
+        msg: "No AI-generated image found in Media Library",
+        projectId,
+        filename,
+      });
+      return null;
+    }
+
+    logger.info({
+      msg: "Found AI-generated image in Media Library, fetching from R2",
+      projectId,
+      filename,
+      uploadId: upload.id,
+      storageKey: upload.storageKey,
+    });
+
+    // Fetch the image from R2
+    const r2Client = new R2Client();
+    const { buffer } = await r2Client.getFileBuffer(upload.storageKey);
+
+    logger.info({
+      msg: "Successfully fetched AI-generated image from R2",
+      filename,
+      bytes: buffer.length,
+    });
+
+    return buffer;
+  } catch (error) {
+    logger.warn({
+      msg: "Failed to fetch AI-generated image from Media Library",
+      projectId,
+      filename,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
 /**
  * Restore a V2 fragment in the Modal sandbox
  */
@@ -1389,17 +1450,20 @@ export async function restoreV2FragmentInSandbox(
         : fragment.files;
 
     // Use optimized restore for imported projects (parallel writes, bulk mkdir)
+    // Pass projectId to enable AI-generated image restoration from Media Library
     if (isImportedProject) {
       await restoreFilesInSandboxOptimized(
         sandbox,
         files as { [path: string]: string },
         projectLogger,
+        projectId,
       );
     } else {
       await restoreFilesInSandbox(
         sandbox,
         files as { [path: string]: string },
         projectLogger,
+        projectId,
       );
     }
 
@@ -1420,19 +1484,29 @@ export async function restoreV2FragmentInSandbox(
 
 /**
  * Restore files in the Modal sandbox
+ * 
+ * Handles three types of content:
+ * 1. Regular text files
+ * 2. Base64-encoded binary files (__BASE64__ or data: prefix)
+ * 3. AI-generated image placeholders ([Binary image file: ...]) - restored from R2
  */
 export async function restoreFilesInSandbox(
   sandbox: Sandbox,
   files: { [path: string]: string },
   logger: Logger = defaultLogger,
+  projectId?: string,
 ): Promise<void> {
   logger.info({
     msg: "Restoring files in sandbox",
     fileCount: Object.keys(files).length,
     sandboxId: sandbox.sandboxId,
+    hasProjectId: !!projectId,
   });
 
   try {
+    // Track image placeholders to restore from Media Library
+    const imagePlaceholders: Array<{ filePath: string; filename: string }> = [];
+
     // Write each file to the sandbox
     for (const [filePath, content] of Object.entries(files)) {
       const fullPath = `/workspace/${filePath}`;
@@ -1441,6 +1515,20 @@ export async function restoreFilesInSandbox(
       const dirPath = fullPath.substring(0, fullPath.lastIndexOf("/"));
       if (dirPath) {
         await sandbox.exec(["mkdir", "-p", dirPath]);
+      }
+
+      // Check for AI-generated image placeholder
+      const placeholderMatch = content.match(BINARY_IMAGE_PLACEHOLDER_REGEX);
+      if (placeholderMatch) {
+        // This is a placeholder for an AI-generated image
+        const imageFilename = placeholderMatch[1];
+        imagePlaceholders.push({ filePath, filename: imageFilename });
+        logger.debug({
+          msg: "Found AI-generated image placeholder, will restore from Media Library",
+          filePath,
+          filename: imageFilename,
+        });
+        continue; // Skip for now, we'll restore these from R2
       }
 
       // Check if content is base64 encoded (for binary files like images)
@@ -1484,6 +1572,59 @@ export async function restoreFilesInSandbox(
       });
     }
 
+    // Restore AI-generated images from Media Library (R2)
+    if (imagePlaceholders.length > 0 && projectId) {
+      logger.info({
+        msg: "Restoring AI-generated images from Media Library",
+        count: imagePlaceholders.length,
+        projectId,
+      });
+
+      let restoredCount = 0;
+      let failedCount = 0;
+
+      for (const { filePath, filename } of imagePlaceholders) {
+        const imageBuffer = await fetchAIGeneratedImageFromMediaLibrary(
+          projectId,
+          filename,
+          logger,
+        );
+
+        if (imageBuffer) {
+          const fullPath = `/workspace/${filePath}`;
+          const file = await sandbox.open(fullPath, "w");
+          await file.write(new Uint8Array(imageBuffer));
+          await file.close();
+          restoredCount++;
+
+          logger.debug({
+            msg: "Restored AI-generated image from Media Library",
+            filePath,
+            bytes: imageBuffer.length,
+          });
+        } else {
+          failedCount++;
+          logger.warn({
+            msg: "Could not restore AI-generated image - not found in Media Library",
+            filePath,
+            filename,
+          });
+        }
+      }
+
+      logger.info({
+        msg: "Finished restoring AI-generated images",
+        restoredCount,
+        failedCount,
+        totalPlaceholders: imagePlaceholders.length,
+      });
+    } else if (imagePlaceholders.length > 0 && !projectId) {
+      logger.warn({
+        msg: "Cannot restore AI-generated images - no projectId provided",
+        placeholderCount: imagePlaceholders.length,
+      });
+    }
+
     logger.info({
       msg: "Files restored successfully",
       fileCount: Object.keys(files).length,
@@ -1505,27 +1646,45 @@ export async function restoreFilesInSandbox(
 /**
  * Optimized file restoration for imported projects
  * Creates all directories at once and writes files in parallel batches
+ * 
+ * Handles three types of content:
+ * 1. Regular text files
+ * 2. Base64-encoded binary files (__BASE64__ or data: prefix)
+ * 3. AI-generated image placeholders ([Binary image file: ...]) - restored from R2
  */
 export async function restoreFilesInSandboxOptimized(
   sandbox: Sandbox,
   files: { [path: string]: string },
   logger: Logger = defaultLogger,
+  projectId?: string,
 ): Promise<void> {
   const fileCount = Object.keys(files).length;
   logger.info({
     msg: "Restoring files in sandbox (optimized for import)",
     fileCount,
     sandboxId: sandbox.sandboxId,
+    hasProjectId: !!projectId,
   });
 
   try {
-    // Collect all unique directories first
+    // Collect all unique directories first and identify image placeholders
     const directories = new Set<string>();
-    for (const filePath of Object.keys(files)) {
+    const imagePlaceholders: Array<{ filePath: string; filename: string }> = [];
+    const regularFiles: Array<[string, string]> = [];
+
+    for (const [filePath, content] of Object.entries(files)) {
       const fullPath = `/workspace/${filePath}`;
       const dirPath = fullPath.substring(0, fullPath.lastIndexOf("/"));
       if (dirPath && dirPath !== "/workspace") {
         directories.add(dirPath);
+      }
+
+      // Check for AI-generated image placeholder
+      const placeholderMatch = content.match(BINARY_IMAGE_PLACEHOLDER_REGEX);
+      if (placeholderMatch) {
+        imagePlaceholders.push({ filePath, filename: placeholderMatch[1] });
+      } else {
+        regularFiles.push([filePath, content]);
       }
     }
 
@@ -1539,13 +1698,12 @@ export async function restoreFilesInSandboxOptimized(
       await sandbox.exec(["mkdir", "-p", ...dirsArray]);
     }
 
-    // Write files in parallel batches for speed
+    // Write regular files in parallel batches for speed
     const BATCH_SIZE = 10;
-    const fileEntries = Object.entries(files);
     let filesRestored = 0;
 
-    for (let i = 0; i < fileEntries.length; i += BATCH_SIZE) {
-      const batch = fileEntries.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < regularFiles.length; i += BATCH_SIZE) {
+      const batch = regularFiles.slice(i, i + BATCH_SIZE);
 
       await Promise.all(
         batch.map(async ([filePath, content]) => {
@@ -1591,7 +1749,60 @@ export async function restoreFilesInSandboxOptimized(
       logger.info({
         msg: "Import file restore progress",
         filesRestored,
-        totalFiles: fileCount,
+        totalFiles: regularFiles.length,
+      });
+    }
+
+    // Restore AI-generated images from Media Library (R2) in parallel batches
+    if (imagePlaceholders.length > 0 && projectId) {
+      logger.info({
+        msg: "Restoring AI-generated images from Media Library (optimized)",
+        count: imagePlaceholders.length,
+        projectId,
+      });
+
+      let restoredCount = 0;
+      let failedCount = 0;
+
+      for (let i = 0; i < imagePlaceholders.length; i += BATCH_SIZE) {
+        const batch = imagePlaceholders.slice(i, i + BATCH_SIZE);
+
+        await Promise.all(
+          batch.map(async ({ filePath, filename }) => {
+            const imageBuffer = await fetchAIGeneratedImageFromMediaLibrary(
+              projectId,
+              filename,
+              logger,
+            );
+
+            if (imageBuffer) {
+              const fullPath = `/workspace/${filePath}`;
+              const file = await sandbox.open(fullPath, "w");
+              await file.write(new Uint8Array(imageBuffer));
+              await file.close();
+              restoredCount++;
+            } else {
+              failedCount++;
+              logger.warn({
+                msg: "Could not restore AI-generated image - not found in Media Library",
+                filePath,
+                filename,
+              });
+            }
+          }),
+        );
+      }
+
+      logger.info({
+        msg: "Finished restoring AI-generated images (optimized)",
+        restoredCount,
+        failedCount,
+        totalPlaceholders: imagePlaceholders.length,
+      });
+    } else if (imagePlaceholders.length > 0 && !projectId) {
+      logger.warn({
+        msg: "Cannot restore AI-generated images - no projectId provided",
+        placeholderCount: imagePlaceholders.length,
       });
     }
 
@@ -1611,6 +1822,134 @@ export async function restoreFilesInSandboxOptimized(
       cause: error,
     });
   }
+}
+
+/**
+ * Ensure Shipper IDs plugin is configured in vite.config
+ * Adds import and plugin usage if missing
+ */
+async function ensureShipperIdsPluginInConfig(
+  viteConfigPath: string,
+  content: string,
+  isJavaScriptOnly: boolean,
+  logger: Logger,
+): Promise<{ content: string; wasPatched: boolean }> {
+  // Check if plugin is already configured
+  const hasPluginImport =
+    content.includes("shipperIdsPlugin") ||
+    content.includes("vite-plugin-shipper-ids");
+  const hasPluginInArray = content.includes("shipperIdsPlugin()");
+
+  if (hasPluginImport && hasPluginInArray) {
+    logger.info({
+      msg: "Shipper IDs plugin already configured in vite.config",
+    });
+    return { content, wasPatched: false };
+  }
+
+  let modifiedContent = content;
+  let wasPatched = false;
+
+  // Determine plugin file extension
+  const pluginExtension = isJavaScriptOnly ? ".js" : ".ts";
+  const pluginImportPath = `./plugins/vite-plugin-shipper-ids${pluginExtension}`;
+
+  // Add import statement if missing
+  if (!hasPluginImport) {
+    // Find the last import statement
+    const importRegex = /^import\s+.*$/gm;
+    const imports = content.match(importRegex);
+    if (imports && imports.length > 0) {
+      // Add after the last import
+      const lastImport = imports[imports.length - 1];
+      const lastImportIndex = content.lastIndexOf(lastImport);
+      const insertIndex = lastImportIndex + lastImport.length;
+      modifiedContent =
+        modifiedContent.slice(0, insertIndex) +
+        `\nimport { shipperIdsPlugin } from '${pluginImportPath}';` +
+        modifiedContent.slice(insertIndex);
+      wasPatched = true;
+      logger.info({
+        msg: "Added shipperIdsPlugin import to vite.config",
+      });
+    } else {
+      // No imports found, add at the top after any comments
+      const commentMatch = content.match(/^(\/\/.*\n)*/);
+      if (commentMatch) {
+        const insertIndex = commentMatch[0].length;
+        modifiedContent =
+          modifiedContent.slice(0, insertIndex) +
+          `import { shipperIdsPlugin } from '${pluginImportPath}';\n` +
+          modifiedContent.slice(insertIndex);
+      } else {
+        modifiedContent = `import { shipperIdsPlugin } from '${pluginImportPath}';\n${modifiedContent}`;
+      }
+      wasPatched = true;
+      logger.info({
+        msg: "Added shipperIdsPlugin import at top of vite.config",
+      });
+    }
+  }
+
+  // Add plugin to plugins array if missing
+  if (!hasPluginInArray) {
+    // Try to find plugins array
+    const pluginsArrayMatch = modifiedContent.match(
+      /plugins:\s*\[([\s\S]*?)\]/,
+    );
+    if (pluginsArrayMatch) {
+      const pluginsContent = pluginsArrayMatch[1];
+      const isMultiLine = pluginsContent.includes("\n");
+
+      if (isMultiLine) {
+        // Multi-line: add at the beginning
+        const trimmedPlugins = pluginsContent.replace(/^\s*/, "");
+        const newPlugins = `plugins: [\n    shipperIdsPlugin(),\n    ${trimmedPlugins}`;
+        modifiedContent = modifiedContent.replace(
+          /plugins:\s*\[([\s\S]*?)\]/,
+          newPlugins,
+        );
+      } else {
+        // Single line: add at the beginning
+        const trimmedPlugins = pluginsContent.trim();
+        const newPlugins = trimmedPlugins
+          ? `plugins: [shipperIdsPlugin(), ${trimmedPlugins}]`
+          : "plugins: [shipperIdsPlugin()]";
+        modifiedContent = modifiedContent.replace(
+          /plugins:\s*\[([\s\S]*?)\]/,
+          newPlugins,
+        );
+      }
+      wasPatched = true;
+      logger.info({
+        msg: "Added shipperIdsPlugin() to plugins array",
+      });
+    } else {
+      // No plugins array found - need to add it
+      // Try to find defineConfig call
+      const defineConfigMatch = modifiedContent.match(
+        /export\s+default\s+defineConfig\s*\(\s*\{/,
+      );
+      if (defineConfigMatch) {
+        const insertIndex =
+          defineConfigMatch.index! + defineConfigMatch[0].length;
+        modifiedContent =
+          modifiedContent.slice(0, insertIndex) +
+          `\n  plugins: [shipperIdsPlugin()],` +
+          modifiedContent.slice(insertIndex);
+        wasPatched = true;
+        logger.info({
+          msg: "Added plugins array with shipperIdsPlugin() to vite.config",
+        });
+      } else {
+        logger.warn({
+          msg: "Could not find plugins array or defineConfig to add shipperIdsPlugin",
+        });
+      }
+    }
+  }
+
+  return { content: modifiedContent, wasPatched };
 }
 
 /**
@@ -1704,13 +2043,13 @@ export async function patchViteConfigForImport(
             // Multi-line: add on new line before closing bracket
             // Remove trailing whitespace/newlines, add our entries, then closing bracket
             const trimmedHosts = existingHosts.replace(/[\s,]*$/, "");
-            newAllowedHosts = `allowedHosts: [${trimmedHosts},\n    ".modal.host",\n    "shipper.now",\n    ".localhost"\n  ]`;
+            newAllowedHosts = `allowedHosts: [${trimmedHosts},\n    ".modal.host",\n    "shipper.now",\n    "localhost",\n    ".localhost"\n  ]`;
           } else {
             // Single line: just append
             const trimmedHosts = existingHosts.trim();
             const newHosts = trimmedHosts
-              ? `${trimmedHosts}, ".modal.host", "shipper.now", ".localhost"`
-              : '".modal.host", "shipper.now", ".localhost"';
+              ? `${trimmedHosts}, ".modal.host", "shipper.now", "localhost", ".localhost"`
+              : '".modal.host", "shipper.now", "localhost", ".localhost"';
             newAllowedHosts = `allowedHosts: [${newHosts}]`;
           }
 
@@ -1719,7 +2058,7 @@ export async function patchViteConfigForImport(
             newAllowedHosts,
           );
           logger.info({
-            msg: "Added .modal.host, shipper.now, and .localhost to existing allowedHosts array",
+            msg: "Added .modal.host, shipper.now, localhost, and .localhost to existing allowedHosts array",
           });
         } else {
           logger.warn({
@@ -1741,7 +2080,7 @@ export async function patchViteConfigForImport(
       if (!hasModalHost) {
         content = content.replace(
           /server:\s*\{/,
-          `server: {\n    allowedHosts: [".modal.host", "shipper.now", ".localhost"],`,
+          `server: {\n    allowedHosts: [".modal.host", "shipper.now", "localhost", ".localhost"],`,
         );
       }
       logger.info({
@@ -1751,7 +2090,7 @@ export async function patchViteConfigForImport(
       // No server block - add it with both host and allowedHosts
       content = content.replace(
         /export default\s+defineConfig\(\{/,
-        `export default defineConfig({\n  server: {\n    host: '0.0.0.0',\n    allowedHosts: [".modal.host", "shipper.now", ".localhost"],\n  },`,
+        `export default defineConfig({\n  server: {\n    host: '0.0.0.0',\n    allowedHosts: [".modal.host", "shipper.now", "localhost", ".localhost"],\n  },`,
       );
       logger.info({ msg: "Added server block with host and allowedHosts" });
     } else {
@@ -1773,6 +2112,17 @@ export async function patchViteConfigForImport(
         msg: "Added port: 5173 to server block",
       });
     }
+
+    // Ensure Shipper IDs plugin is configured
+    const isJavaScriptOnly =
+      viteConfigPath.endsWith(".js") || viteConfigPath.endsWith(".mjs");
+    const pluginResult = await ensureShipperIdsPluginInConfig(
+      viteConfigPath,
+      content,
+      isJavaScriptOnly,
+      logger,
+    );
+    content = pluginResult.content;
 
     // Write patched config back
     const writeFile = await sandbox.open(viteConfigPath, "w");
@@ -2532,6 +2882,69 @@ export async function readFile(
 }
 
 /**
+ * Read a binary file from the Modal sandbox as base64
+ */
+export async function readFileBase64(
+  sandboxId: string,
+  filePath: string,
+  logger: Logger = defaultLogger,
+): Promise<{ base64: string; mimeType: string }> {
+  logger.info({
+    msg: "Reading binary file from sandbox as base64",
+    sandboxId,
+    filePath,
+  });
+
+  try {
+    const sandbox = await modalClient.sandboxes.fromId(sandboxId);
+    const fullPath = `/workspace/${filePath}`;
+
+    const file = await sandbox.open(fullPath, "r");
+    const data = await file.read();
+    await file.close();
+
+    // Convert to base64
+    const base64 = Buffer.from(data).toString("base64");
+
+    // Determine MIME type from extension
+    const ext = filePath.split(".").pop()?.toLowerCase() || "";
+    const mimeTypes: Record<string, string> = {
+      png: "image/png",
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      gif: "image/gif",
+      svg: "image/svg+xml",
+      webp: "image/webp",
+      ico: "image/x-icon",
+      bmp: "image/bmp",
+      pdf: "application/pdf",
+    };
+    const mimeType = mimeTypes[ext] || "application/octet-stream";
+
+    logger.info({
+      msg: "Binary file read as base64",
+      sandboxId,
+      filePath,
+      bytes: data.length,
+      mimeType,
+    });
+    return { base64, mimeType };
+  } catch (error) {
+    logger.error({
+      msg: "Error reading binary file",
+      sandboxId,
+      filePath,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw new TRPCError({
+      code: "INTERNAL_SERVER_ERROR",
+      message: "Failed to read binary file",
+      cause: error,
+    });
+  }
+}
+
+/**
  * Write a file to the Modal sandbox
  */
 export async function writeFile(
@@ -2576,6 +2989,56 @@ export async function writeFile(
     throw new TRPCError({
       code: "INTERNAL_SERVER_ERROR",
       message: "Failed to write file",
+      cause: error,
+    });
+  }
+}
+
+/**
+ * Write a binary file to the Modal sandbox
+ */
+export async function writeFileBinary(
+  sandboxId: string,
+  filePath: string,
+  buffer: Buffer,
+  logger: Logger = defaultLogger,
+): Promise<void> {
+  logger.info({
+    msg: "Writing binary file to sandbox",
+    sandboxId,
+    filePath,
+    bytes: buffer.length,
+  });
+
+  try {
+    const sandbox = await modalClient.sandboxes.fromId(sandboxId);
+    const fullPath = `/workspace/${filePath}`;
+
+    // Ensure parent directory exists
+    const dirPath = fullPath.substring(0, fullPath.lastIndexOf("/"));
+    if (dirPath) {
+      await sandbox.exec(["mkdir", "-p", dirPath]);
+    }
+
+    const file = await sandbox.open(fullPath, "w");
+    await file.write(new Uint8Array(buffer));
+    await file.close();
+
+    logger.info({
+      msg: "Binary file written",
+      sandboxId,
+      filePath,
+    });
+  } catch (error) {
+    logger.error({
+      msg: "Error writing binary file",
+      sandboxId,
+      filePath,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw new TRPCError({
+      code: "INTERNAL_SERVER_ERROR",
+      message: "Failed to write binary file",
       cause: error,
     });
   }
@@ -2662,11 +3125,12 @@ export async function listFiles(
         // Remove /workspace/ prefix
         const relativePath = filePath.replace(/^\/workspace\//, "");
 
-        // Additional filter: skip hidden files at root level, but allow .env* files
+        // Additional filter: skip hidden files at root level, but allow .env* files and .shipper directory
         const isHiddenFile = relativePath.startsWith(".");
         const isEnvFile = /^\.env(\..+)?$/.test(relativePath); // .env, .env.local, .env.production, etc.
+        const isShipperFile = relativePath.startsWith(".shipper/");
 
-        if (relativePath && (!isHiddenFile || isEnvFile)) {
+        if (relativePath && (!isHiddenFile || isEnvFile || isShipperFile)) {
           files.set(relativePath, {
             size: isNaN(size) ? 0 : size,
             modified: Date.now(),
@@ -2925,9 +3389,10 @@ export async function restoreFilesById(
   sandboxId: string,
   files: { [path: string]: string },
   logger: Logger = defaultLogger,
+  projectId?: string,
 ): Promise<void> {
   const sandbox = await modalClient.sandboxes.fromId(sandboxId);
-  return restoreFilesInSandbox(sandbox, files, logger);
+  return restoreFilesInSandbox(sandbox, files, logger, projectId);
 }
 
 /**
@@ -3925,6 +4390,7 @@ deployApp()
     };
   } else {
     throw new Error(
+      
       `Node.js deployment script failed with exit code ${deployExitCode}: ${logs}`,
     );
   }

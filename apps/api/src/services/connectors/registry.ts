@@ -202,6 +202,47 @@ class ConnectorRegistry {
     return decrypt(connection.accessToken);
   }
 
+  /**
+   * Refresh metadata for a personal connection
+   * Fetches latest data from the service and updates DB
+   */
+  async refreshPersonalConnectionMetadata(
+    userId: string,
+    provider: PersonalConnectorProvider,
+  ): Promise<{ metadata: Record<string, unknown>; capabilities?: Record<string, unknown> } | null> {
+    const connector = this.getPersonalConnector(provider);
+    if (!connector?.refreshMetadata) return null;
+
+    const connection = await prisma.personalConnector.findFirst({
+      where: { userId, provider, status: "ACTIVE" },
+    });
+
+    if (!connection) return null;
+
+    try {
+      const accessToken = decrypt(connection.accessToken);
+      const refreshed = await connector.refreshMetadata(accessToken);
+
+      if (!refreshed) return null;
+
+      // Update metadata in database
+      await prisma.personalConnector.update({
+        where: { id: connection.id },
+        data: {
+          metadata: refreshed.metadata as object | undefined,
+          lastUsedAt: new Date(),
+        },
+      });
+
+      return {
+        metadata: refreshed.metadata,
+        capabilities: refreshed.capabilities,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   // ==========================================================================
   // Team/Project Connection Methods
   // ==========================================================================

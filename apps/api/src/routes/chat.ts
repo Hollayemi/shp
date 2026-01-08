@@ -32,7 +32,16 @@ import {
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { prisma } from "@shipper/database";
 import mammoth from "mammoth";
-import { tools, type ToolsContext } from "../services/ai-tools.js";
+import {
+  tools,
+  type ToolsContext,
+  ASK_CLARIFYING_QUESTIONS_TOOL_NAME,
+} from "../services/ai-tools.js";
+import {
+  refinePlanningPrompt,
+  type PlanningQuestion,
+  type PlanningAnswer,
+} from "../services/planning-questions-generator.js";
 import { getFullStackPrompt } from "../prompts/v2-full-stack-prompt.js";
 import {
   getCodeImportContext,
@@ -40,6 +49,7 @@ import {
 } from "../services/code-import-context.js";
 import { getSandbox } from "../services/modal-sandbox-manager.js";
 import { ensureSandboxRecovered } from "../services/sandbox-health.js";
+import { UploadService } from "../services/upload-service.js";
 import { CreditManager } from "../services/credits.js";
 import {
   analyzePromptComplexity,
@@ -71,6 +81,30 @@ import {
   formatDeploymentError,
 } from "../services/shipper-cloud-hitl.js";
 import { ConvexDeploymentAPI, decryptDeployKey } from "@shipper/convex";
+import { connectorRegistry } from "../services/connectors/index.js";
+// ABLY (kept for potential rollback - currently using SSE)
+// import {
+//   broadcastStreamingStart,
+//   broadcastStreamingStop,
+//   broadcastAIChunk,
+//   broadcastAIToolCall,
+//   broadcastAIToolResult,
+//   broadcastAIComplete,
+//   broadcastAIError,
+//   flushPendingChunks,
+// } from "../services/ably.js";
+
+// SSE Pub/Sub (self-hosted alternative to Ably)
+import {
+  ssePublishStreamingStart as broadcastStreamingStart,
+  ssePublishStreamingStop as broadcastStreamingStop,
+  ssePublishAIChunk as broadcastAIChunk,
+  ssePublishAIToolCall as broadcastAIToolCall,
+  ssePublishAIToolResult as broadcastAIToolResult,
+  ssePublishAIComplete as broadcastAIComplete,
+  ssePublishAIError as broadcastAIError,
+  sseFlushPendingChunks as flushPendingChunks,
+} from "../services/sse-pubsub.js";
 
 const anthropic = createAnthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -206,6 +240,9 @@ const chatRequestSchema = z.object({
     createdAt: z.union([z.string(), z.date(), z.any()]).optional(),
   }),
   projectId: z.string().uuid(),
+  // Chat mode: when true, AI should ask clarifying questions before building
+  // No sandbox is created until questions are answered
+  chatMode: z.boolean().optional().default(false),
 });
 
 // Helper function to deslugify project names
@@ -716,7 +753,7 @@ router.post(
         return res.status(400).json(response);
       }
 
-      const { message: rawMessage, projectId } = parsed.data;
+      const { message: rawMessage, projectId, chatMode } = parsed.data;
 
       // Validate and convert to UIMessage format using AI SDK
       const validationResult = await safeValidateUIMessages({
@@ -825,6 +862,11 @@ router.post(
             },
           });
 
+          // Get workspace ID for credit operations
+          // This supports both new workspace-centric and legacy user-centric projects
+          const workspaceId =
+            await CreditManager.getWorkspaceIdFromProject(projectId);
+
           if (!project) {
             throw new Error("Project not found or access denied");
           }
@@ -850,11 +892,37 @@ router.post(
           // Register abort controller for this stream so DELETE can abort immediately
           registerChatAbort(streamId, abortController);
 
+          // Extract user message content for Ably broadcast
+          const userMessageContent =
+            message.role === "user" ? getMessageContent(message) : undefined;
+
+          req.logger?.info({
+            msg: "Broadcasting streaming start with user message",
+            messageRole: message.role,
+            userMessageContent: userMessageContent?.substring(0, 100),
+            hasUserMessage: !!userMessageContent,
+          });
+
+          // 🔴 ABLY: Broadcast streaming start to all project viewers (includes user message)
+          broadcastStreamingStart(
+            projectId,
+            userId,
+            undefined,
+            assistantMessageId ?? undefined,
+            userMessageContent, // Include user's prompt so remote users see what was asked
+          ).catch((err) => {
+            req.logger?.warn({
+              msg: "Failed to broadcast streaming start",
+              error: err,
+            });
+          });
+
           // Store complexity analysis and template
           // For imported projects, use the empty bun template
+          // For new projects, use tanstack-template (the modern TanStack default)
           let selectedTemplate = isImported
             ? "shipper-empty-bun-template"
-            : "vite-database-template";
+            : "tanstack-template";
           let complexityAnalysis: ComplexityAnalysis | undefined;
 
           // Extract message content once for reuse
@@ -1060,6 +1128,85 @@ router.post(
           });
 
           // ========================================
+          // Process TOOL_RESULT messages from frontend
+          // ========================================
+          // The frontend sends tool results as special user messages because
+          // addToolResult only updates client state and doesn't persist to DB.
+          // Format: [TOOL_RESULT:toolCallId:toolName]\n{jsonOutput}
+          const toolResultRegex = /^\[TOOL_RESULT:([^:]+):([^\]]+)\]\n(.+)$/s;
+          const lastMessage = rawMessages[rawMessages.length - 1];
+
+          if (lastMessage?.role === "USER") {
+            const match = lastMessage.content.match(toolResultRegex);
+            if (match) {
+              const [, toolCallId, toolName, outputJson] = match;
+              req.logger?.info({
+                msg: "Found TOOL_RESULT message from frontend",
+                toolCallId,
+                toolName,
+                outputLength: outputJson.length,
+              });
+
+              // Find the assistant message with this tool call and update it
+              for (const msg of rawMessages) {
+                if (msg.role !== "ASSISTANT") continue;
+
+                let parts;
+                try {
+                  parts = JSON.parse(msg.content);
+                } catch {
+                  continue;
+                }
+
+                if (!Array.isArray(parts)) continue;
+
+                let found = false;
+                for (const part of parts) {
+                  const typedPart = part as {
+                    type?: string;
+                    toolName?: string;
+                    toolCallId?: string;
+                    toolInvocationId?: string;
+                    output?: unknown;
+                  };
+
+                  const partToolCallId =
+                    typedPart.toolCallId || typedPart.toolInvocationId;
+                  if (partToolCallId === toolCallId) {
+                    // Update the tool part with the output
+                    typedPart.output = outputJson;
+                    found = true;
+                    req.logger?.info({
+                      msg: "Updated assistant message with tool result",
+                      messageId: msg.id,
+                      toolCallId,
+                      toolName,
+                    });
+                    break;
+                  }
+                }
+
+                if (found) {
+                  // Save the updated message
+                  await prisma.v2Message.update({
+                    where: { id: msg.id },
+                    data: { content: JSON.stringify(parts) },
+                  });
+                  break;
+                }
+              }
+
+              // Reload rawMessages to include the updated tool result
+              rawMessages.length = 0;
+              const reloadedMessages = await prisma.v2Message.findMany({
+                where: { projectId },
+                orderBy: { createdAt: "asc" },
+              });
+              rawMessages.push(...reloadedMessages);
+            }
+          }
+
+          // ========================================
           // Auto-decline pending Shipper Cloud tool calls
           // ========================================
           // If there are any pending deployToShipperCloud tool calls without a response,
@@ -1147,7 +1294,7 @@ router.post(
             | "deployment"
             | "api-keys"
             | "stripe"
-            | "enableAI"
+            | "planning"
             | null = null;
 
           // Store Stripe key when extracted from requestApiKeys for later use
@@ -1537,6 +1684,113 @@ router.post(
                 continue;
               }
 
+              // Look for askClarifyingQuestions tool parts (Planning Questions HITL)
+              const isPlanningQuestionsTool =
+                typedPart.type ===
+                  `tool-${ASK_CLARIFYING_QUESTIONS_TOOL_NAME}` ||
+                typedPart.toolName === ASK_CLARIFYING_QUESTIONS_TOOL_NAME;
+
+              if (isPlanningQuestionsTool) {
+                const planningToolCallId =
+                  typedPart.toolCallId || typedPart.toolInvocationId;
+                if (!planningToolCallId) continue;
+
+                const output = typedPart.output;
+
+                // Parse the output - frontend sends JSON with confirmed status and answers
+                if (typeof output === "string") {
+                  try {
+                    const parsed = JSON.parse(output);
+
+                    // Skip if already processed (has refinedPrompt from previous processing)
+                    if (parsed.refinedPrompt || parsed.processed === true) {
+                      continue;
+                    }
+
+                    // Check if user confirmed with answers
+                    if (
+                      parsed.confirmed &&
+                      parsed.answers &&
+                      Array.isArray(parsed.answers)
+                    ) {
+                      req.logger?.info({
+                        msg: "HITL: Processing planning questions answers",
+                        toolCallId: planningToolCallId,
+                        answerCount: parsed.answers.length,
+                      });
+
+                      try {
+                        // Process answers using refinePlanningPrompt
+                        const refinedResult = await refinePlanningPrompt(
+                          parsed.originalPrompt || "",
+                          parsed.projectSummary || "",
+                          (parsed.questions || []) as PlanningQuestion[],
+                          parsed.answers as PlanningAnswer[],
+                          userId,
+                        );
+
+                        // Return the processed result to the AI
+                        hitlResultMessage = JSON.stringify({
+                          processed: true,
+                          confirmed: true,
+                          refinedPrompt: refinedResult.refinedPrompt,
+                          summary: refinedResult.summary,
+                          keyFeatures: refinedResult.keyFeatures,
+                          targetAudience: refinedResult.targetAudience,
+                          designPreferences: refinedResult.designPreferences,
+                          instruction:
+                            "NOW GENERATE A DETAILED IMPLEMENTATION PLAN based on the refined requirements above. Use headers with emojis, organize by features, and be specific about pages and components.",
+                        });
+
+                        req.logger?.info({
+                          msg: "HITL: Planning questions processed successfully",
+                          toolCallId: planningToolCallId,
+                          summaryLength: refinedResult.summary.length,
+                          featureCount: refinedResult.keyFeatures.length,
+                        });
+
+                        hitlProcessed = true;
+                        hitlToolCallId = planningToolCallId;
+                        hitlResultType = "planning";
+                      } catch (refineError) {
+                        req.logger?.error({
+                          msg: "HITL: Failed to refine planning prompt",
+                          error:
+                            refineError instanceof Error
+                              ? refineError.message
+                              : String(refineError),
+                        });
+
+                        // Fall back to simpler approach
+                        hitlResultMessage = JSON.stringify({
+                          processed: true,
+                          confirmed: true,
+                          originalPrompt: parsed.originalPrompt,
+                          answers: parsed.answers,
+                          projectSummary: parsed.projectSummary,
+                          instruction:
+                            "The user answered the planning questions. NOW GENERATE A DETAILED IMPLEMENTATION PLAN based on their answers.",
+                        });
+                        hitlProcessed = true;
+                        hitlToolCallId = planningToolCallId;
+                        hitlResultType = "planning";
+                      }
+                    }
+                  } catch (e) {
+                    // Not JSON, ignore, but log for debugging purposes
+                    req.logger?.debug({
+                      msg: "HITL: Planning questions output was not valid JSON, ignoring",
+                      output:
+                        typeof output === "string"
+                          ? output.substring(0, 100)
+                          : output,
+                      error: e instanceof Error ? e.message : String(e),
+                    });
+                  }
+                }
+                continue;
+              }
+
               // Look for deployToShipperCloud tool parts
               const isShipperCloudTool =
                 typedPart.type === "tool-deployToShipperCloud" ||
@@ -1648,11 +1902,18 @@ router.post(
                   typedPart.toolName === "stripeListProducts" ||
                   typedPart.toolName === "stripeListPrices" ||
                   typedPart.toolName === "stripeCreateProductAndPrice";
+                const isPlanningQuestionsTool =
+                  typedPart.type ===
+                    `tool-${ASK_CLARIFYING_QUESTIONS_TOOL_NAME}` ||
+                  typedPart.toolName === ASK_CLARIFYING_QUESTIONS_TOOL_NAME;
                 const partToolCallId =
                   typedPart.toolCallId || typedPart.toolInvocationId;
 
                 if (
-                  (isShipperCloudTool || isApiKeysTool || isStripeHitlTool) &&
+                  (isShipperCloudTool ||
+                    isApiKeysTool ||
+                    isStripeHitlTool ||
+                    isPlanningQuestionsTool) &&
                   partToolCallId === hitlToolCallId
                 ) {
                   // Update the output with the result
@@ -2025,42 +2286,86 @@ router.post(
             hasCalledGetFiles: false, // Track if getFiles has been called (required for imports)
           };
 
-          // Ensure sandbox is available and healthy
-          const fragmentIdForRecovery =
-            toolsContext.currentFragmentId || project.activeFragmentId || null;
+          // In chat mode, only skip sandbox on the first message (planning phase)
+          // After that, we need the sandbox for building
+          const isFirstMessageInChatMode =
+            chatMode &&
+            !uiMessages.some((msg: UIMessage) => msg.role === "assistant");
 
-          const recoveryResult = await ensureSandboxRecovered(projectId, {
-            fragmentId: fragmentIdForRecovery,
-            templateName: selectedTemplate,
-            logger: req.logger || undefined,
-          });
+          if (!isFirstMessageInChatMode) {
+            // Ensure sandbox is available and healthy
+            const fragmentIdForRecovery =
+              toolsContext.currentFragmentId ||
+              project.activeFragmentId ||
+              null;
 
-          req.logger?.info({
-            msg: "Sandbox recovery check complete",
-            projectId,
-            fragmentId: fragmentIdForRecovery,
-            recovered: recoveryResult.recovered,
-          });
+            const recoveryResult = await ensureSandboxRecovered(projectId, {
+              fragmentId: fragmentIdForRecovery,
+              templateName: selectedTemplate,
+              logger: req.logger || undefined,
+            });
 
-          req.logger?.info("Setting up sandbox");
-          const sandboxInfo = await getSandbox(projectId, req.logger);
-
-          if (!sandboxInfo) {
-            req.logger?.error({
-              msg: "Sandbox unavailable after recovery",
+            req.logger?.info({
+              msg: "Sandbox recovery check complete",
               projectId,
               fragmentId: fragmentIdForRecovery,
+              recovered: recoveryResult.recovered,
             });
-            throw new Error(
-              "Sandbox is currently unavailable. Please retry the request in a few seconds.",
-            );
-          }
 
-          // Update tools context with sandbox info
-          toolsContext.sandbox = sandboxInfo.sandbox;
-          toolsContext.sandboxId = sandboxInfo.sandboxId;
-          toolsContext.sandboxUrl = sandboxInfo.sandboxUrl;
-          toolsContext.files = sandboxInfo.files;
+            req.logger?.info("Setting up sandbox");
+            const sandboxInfo = await getSandbox(projectId, req.logger);
+
+            if (!sandboxInfo) {
+              req.logger?.error({
+                msg: "Sandbox unavailable after recovery",
+                projectId,
+                fragmentId: fragmentIdForRecovery,
+              });
+              throw new Error(
+                "Sandbox is currently unavailable. Please retry the request in a few seconds.",
+              );
+            }
+
+            // Update tools context with sandbox info
+            toolsContext.sandbox = sandboxInfo.sandbox;
+            toolsContext.sandboxId = sandboxInfo.sandboxId;
+            toolsContext.sandboxUrl = sandboxInfo.sandboxUrl;
+            toolsContext.files = sandboxInfo.files;
+
+            // Sync any uploaded images to sandbox's public/images folder
+            // This ensures user-uploaded images from chat are available in the project
+            try {
+              const uploadService = new UploadService();
+              const syncResult =
+                await uploadService.syncProjectUploadsToSandbox(
+                  projectId,
+                  sandboxInfo.sandboxId,
+                );
+              if (syncResult.synced > 0) {
+                req.logger?.info({
+                  msg: "Synced uploaded images to sandbox",
+                  projectId,
+                  synced: syncResult.synced,
+                  failed: syncResult.failed,
+                });
+              }
+            } catch (syncError) {
+              // Don't fail the chat if sync fails
+              req.logger?.warn({
+                msg: "Failed to sync uploaded images to sandbox",
+                projectId,
+                error:
+                  syncError instanceof Error
+                    ? syncError.message
+                    : String(syncError),
+              });
+            }
+          } else {
+            req.logger?.info({
+              msg: "Chat mode first message - skipping sandbox setup (planning phase)",
+              projectId,
+            });
+          }
 
           // Determine which model to use based on environment and complexity analysis
           // First message: Opus (best quality, 10% margin)
@@ -2086,8 +2391,7 @@ router.post(
             hitlProcessed &&
             (hitlResultType === "deployment" ||
               hitlResultType === "stripe" ||
-              hitlResultType === "api-keys" ||
-              hitlResultType === "enableAI");
+              hitlResultType === "api-keys");
 
           if (!useProductionModels) {
             // Development: always use Haiku for cost savings
@@ -2163,17 +2467,22 @@ router.post(
             messageId: assistantMessageId,
           });
 
-          // Upfront credit check - ensure user has at least minimum credits before starting
+          // Upfront credit check - ensure workspace has at least minimum credits before starting
           // This catches insufficient credits early and provides better UX
           if (message.role === "user") {
-            const affordability = await CreditManager.canAffordOperation(
-              userId,
-              1,
-            );
+            // 🏢 WORKSPACE-CENTRIC: Check workspace credits
+            if (!workspaceId) {
+              throw new Error(
+                "No workspace found for project - cannot check credits",
+              );
+            }
+            const affordability =
+              await CreditManager.canWorkspaceAffordOperation(workspaceId, 1);
             if (!affordability.canAfford) {
               req.logger?.warn({
                 msg: "Insufficient credits - blocking generation",
                 userId,
+                workspaceId,
                 projectId,
                 reason: affordability.reason,
                 currentBalance: affordability.currentBalance,
@@ -2306,13 +2615,193 @@ IMPORTANT: Analyze these files to understand the user's requirements and use the
 DO NOT echo, quote, or reproduce the file contents in your response. Only reference what you learned from them.`
             : "";
 
+          // Tools that modify the codebase - used for mid-build chat mode detection
+          const MODIFICATION_TOOLS = [
+            "createOrEditFiles",
+            "quickEdit",
+            "installPackages",
+            "finalizeWorkingFragment",
+            "createFragmentSnapshot",
+            "deployToShipperCloud",
+            "deployConvex",
+            "scaffoldConvexSchema",
+            "runConvexMutation",
+            "executeStripeCreateProductAndPrice",
+            "setupStripePayments",
+            "enableAI",
+            "generateImage",
+            "executeStripeListProducts",
+            "executeStripeListPrices",
+            "notionWorkspace",
+            "requestApiKeys",
+            "stripeCreateProductAndPrice",
+          ];
+
+          // Detect if building has already started (any modification tools used in conversation)
+          const hasBuildStarted = uiMessages.some((msg: UIMessage) => {
+            if (msg.role === "assistant" && Array.isArray(msg.parts)) {
+              return msg.parts.some(
+                (part: { type?: string }) =>
+                  part.type?.startsWith("tool-") &&
+                  MODIFICATION_TOOLS.some(
+                    (tool) => part.type === `tool-${tool}`,
+                  ),
+              );
+            }
+            return false;
+          });
+
+          // Determine chat mode type:
+          // - Initial planning: chatMode ON, no builds yet -> ask questions flow
+          // - Mid-build chat: chatMode ON, builds have happened -> chat only, no modifications
+          const isMidBuildChat = chatMode && hasBuildStarted;
+
+          // Chat mode instructions - different behavior based on when it's activated
+          const chatModeInstructions = chatMode
+            ? isMidBuildChat
+              ? `
+
+CHAT MODE - CONVERSATION ONLY:
+
+You are in Chat Mode. The user wants to discuss, ask questions, or get help without making changes to the code.
+
+STRICT RULES:
+- You CAN read files and inspect the codebase using getFiles and readFile
+- You CAN explain code, suggest improvements, and help debug
+- You CANNOT create, edit, or delete any files
+- You CANNOT run commands or install packages
+- You CANNOT deploy or make any modifications
+
+WHAT YOU CAN DO:
+- Answer questions about the code
+- Explain how specific functions or components work
+- Suggest improvements or fixes (describe them in detail, but don't implement)
+- Help debug by reading files and analyzing the code
+- Propose implementation plans and architecture decisions
+- Discuss best practices and alternatives
+
+When the user is ready to implement changes, tell them:
+"When you're ready, click the Start Building button and I'll get started!"
+`
+              : `
+
+CHAT MODE - PLANNING PHASE:
+
+STEP 1 - ASK QUESTIONS (on first message with no prior tool results):
+- Call "askClarifyingQuestions" tool immediately
+- Output NOTHING else - just call the tool and stop
+- The user will answer via UI
+
+STEP 2 - GENERATE PLAN (when you receive the processed tool result):
+The tool result will contain a processed/refined version of the user's requirements:
+{
+  "processed": true,
+  "refinedPrompt": "...",  // Enhanced prompt with all requirements incorporated
+  "summary": "...",        // Brief summary of what will be built
+  "keyFeatures": [...],    // List of key features to implement
+  "targetAudience": "...", // Who will use it
+  "designPreferences": "...", // Style preferences
+  "instruction": "..."     // Action to take
+}
+
+When you see this result:
+- Write a CONCISE plan that focuses on WHAT the user will see and do (not how it's built)
+- Use a header with an emoji (e.g., "🎭 Project Name")
+- Start with a brief 1-2 sentence summary of what you understood
+- List the main screens/pages users will interact with
+- For each screen, briefly describe what they can do there
+- If there's an admin side, mention it briefly
+- Keep it SHORT - aim for a quick read, not a detailed spec
+- End with: "Does this look right? Let me know if you want to change anything, or click the Start Building button and I'll get started!"
+
+IMPORTANT PLAN FORMATTING RULES:
+- DO NOT mention technical details (databases, APIs, authentication systems, frameworks)
+- DO NOT include "Backend Requirements" or "Technical Stack" sections
+- DO NOT mention Supabase, Stripe, Convex, or any specific technologies
+- Focus ONLY on the user experience - what screens exist and what users can do
+- Keep it conversational and brief, like explaining the app to a friend
+- The user doesn't need to know HOW it works, just WHAT it does
+
+IMPORTANT: The answers have been pre-processed. DO NOT ask more questions - immediately write the plan!
+
+STEP 3 - HANDLE FEEDBACK:
+- If user requests changes: Update the plan and show the revised version
+- If user is happy with the plan: Remind them to click the Start Building button
+
+STEP 4 - BUILD (only after user clicks Start Building):
+- Once the user clicks the Start Building button, say "Great! Starting the build now..."
+- Begin creating files and building the project using your normal tools
+- This is when you actually write code and create the app
+
+IMPORTANT: Do NOT start building until the user clicks the Start Building button!
+`
+            : "";
+
+          // Fetch user's connected services for AI context
+          const connectedServices = await connectorRegistry.getUserPersonalConnections(userId);
+          const activeConnections = await Promise.all(
+            connectedServices
+              .filter(c => c.status === 'ACTIVE')
+              .map(async (c) => {
+                // Refresh metadata for ElevenLabs to get current plan
+                if (c.provider === 'ELEVENLABS') {
+                  const refreshed = await connectorRegistry.refreshPersonalConnectionMetadata(
+                    userId,
+                    c.provider
+                  );
+                  if (refreshed) {
+                    return {
+                      provider: c.provider.toLowerCase(),
+                      plan: (refreshed.metadata.subscriptionTier as string) || 'free',
+                      capabilities: refreshed.capabilities,
+                    };
+                  }
+                }
+                return {
+                  provider: c.provider.toLowerCase(),
+                  metadata: c.metadata,
+                };
+              })
+          );
+          
+          // Build connected services context for AI
+          const elevenLabsConnection = activeConnections.find(s => s.provider === 'elevenlabs');
+          const hasElevenLabs = !!elevenLabsConnection;
+          
+          let connectedServicesContext = '';
+          if (activeConnections.length > 0) {
+            connectedServicesContext = `\nCONNECTED_SERVICES: ${JSON.stringify(activeConnections)}`;
+            if (hasElevenLabs && elevenLabsConnection) {
+              const caps = elevenLabsConnection.capabilities as Record<string, unknown> | undefined;
+              connectedServicesContext += `\n🔊 ElevenLabs CONNECTED (Plan: ${elevenLabsConnection.plan || 'unknown'})`;
+              connectedServicesContext += `\n   → Use useConnectedService tool to activate for this project.`;
+              
+              if (caps) {
+                connectedServicesContext += `\n\nELEVENLABS CAPABILITIES (for reference - build freely, inform user if errors occur):`;
+                const features = [];
+                if (caps.voiceCloning) features.push('Voice Cloning');
+                if (caps.textToSpeech) features.push('Text-to-Speech');
+                if (caps.realTimeSynthesis) features.push('Real-time Synthesis');
+                if (caps.speechToSpeech) features.push('Speech-to-Speech');
+                if (caps.aiDubbing) features.push('AI Dubbing');
+                if (caps.multilingualSupport) features.push('Multilingual');
+                
+                if (features.length > 0) {
+                  connectedServicesContext += `\n   Available: ${features.join(', ')}`;
+                }
+                
+                connectedServicesContext += `\n   Note: Build any features you want. If API errors (403/429) occur due to plan limits, inform user they may need to upgrade.`;
+              }
+            }
+          }
+
           // Combine base prompt with project context (all cached together)
           const dynamicContext = `PROJECT CONTEXT:
 You are working on the project: "${projectName}"
 ${fileContext}
-
+${chatModeInstructions}
 Maximum steps allowed: ${getMaxSteps(complexityAnalysis)}
-Budget limit: $${HARD_BUDGET_LIMIT_USD}`;
+Budget limit: $${HARD_BUDGET_LIMIT_USD}${connectedServicesContext}`;
 
           // Create system prompt with or without styling image
           // If styling image exists, use createCachedSystemPromptWithImage
@@ -2340,23 +2829,116 @@ Budget limit: $${HARD_BUDGET_LIMIT_USD}`;
 
           // Note: Message caching is applied in prepareStep to handle inter-step caching
 
-          // Prepare tools - exclude deployToShipperCloud if already processed or project has Shipper Cloud
+          // Prepare tools - exclude certain tools based on state
           const allTools = tools(toolsContext);
+
+          // In chat mode, only allow askClarifyingQuestions on the FIRST message
+          // If there are any assistant messages already, questions have been asked
+          const hasAssistantMessages = uiMessages.some(
+            (msg: UIMessage) => msg.role === "assistant",
+          );
+          const shouldExcludeQuestionsTools = chatMode && hasAssistantMessages;
+
+          // Note: MODIFICATION_TOOLS, hasBuildStarted, and isMidBuildChat are defined earlier
+          // (around line 2499) for use in chatModeInstructions
+
           const shouldExcludeShipperCloudTool =
             hitlProcessed || project.shipperCloudEnabled;
-          const chatTools = shouldExcludeShipperCloudTool
-            ? Object.fromEntries(
-                Object.entries(allTools).filter(
-                  ([name]) => name !== "deployToShipperCloud",
-                ),
-              )
-            : allTools;
+
+          // Build list of tools to exclude
+          const toolsToExclude: string[] = [];
+          if (shouldExcludeShipperCloudTool) {
+            toolsToExclude.push("deployToShipperCloud");
+          }
+          if (shouldExcludeQuestionsTools) {
+            toolsToExclude.push("askClarifyingQuestions");
+          }
+          // In chat/plan mode, exclude ALL modification tools
+          // User must click the Plan button to turn it off before AI can build
+          // This applies both to initial planning AND mid-build chat
+          if (chatMode) {
+            toolsToExclude.push(...MODIFICATION_TOOLS);
+          }
+
+          // Determine tools to use
+          let chatTools: Partial<typeof allTools>;
+
+          // On FIRST message in chat mode (no assistant messages yet), ONLY allow askClarifyingQuestions
+          // This prevents the AI from using any other tools during the planning phase
+          const isFirstMessageInPlanMode = chatMode && !hasAssistantMessages;
+          if (isFirstMessageInPlanMode) {
+            // Only include askClarifyingQuestions - exclude ALL other tools
+            chatTools = {
+              askClarifyingQuestions: allTools.askClarifyingQuestions,
+            };
+          } else if (toolsToExclude.length > 0) {
+            chatTools = Object.fromEntries(
+              Object.entries(allTools).filter(
+                ([name]) => !toolsToExclude.includes(name),
+              ),
+            );
+          } else {
+            chatTools = allTools;
+          }
 
           if (shouldExcludeShipperCloudTool) {
             req.logger?.info({
               msg: "Excluding deployToShipperCloud tool",
               reason: hitlProcessed ? "HITL processed" : "already enabled",
               projectId,
+            });
+          }
+
+          // Throttled cancellation check (2s interval to reduce DB load)
+          const throttledCancellationCheck = throttle(() => {
+            prisma.project
+              .findFirst({
+                where: { id: projectId },
+                select: { activeStreamId: true },
+              })
+              .then(async (p) => {
+                if (!p?.activeStreamId || p.activeStreamId !== streamId) {
+                  req.logger?.info({ msg: "Stream cancelled by user" });
+                  wasCancelled = true;
+                  await prisma.project.update({
+                    where: { id: projectId },
+                    data: {
+                      activeStreamId: null,
+                      activeStreamStartedAt: null,
+                    },
+                  });
+                  abortController.abort();
+                }
+              })
+              .catch((error) => {
+                req.logger?.error({
+                  msg: "Error checking stream status",
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              });
+          }, 2000);
+          if (shouldExcludeQuestionsTools) {
+            req.logger?.info({
+              msg: "Excluding askClarifyingQuestions tool - not first message in chat mode",
+              projectId,
+              chatMode,
+              hasAssistantMessages,
+            });
+          }
+
+          if (isFirstMessageInPlanMode) {
+            req.logger?.info({
+              msg: "Plan mode - first message: ONLY askClarifyingQuestions tool available",
+              projectId,
+              availableTools: ["askClarifyingQuestions"],
+            });
+          } else if (chatMode) {
+            req.logger?.info({
+              msg: "Plan mode active - excluding modification tools until user clicks Plan button",
+              projectId,
+              excludedTools: MODIFICATION_TOOLS,
+              isMidBuildChat,
+              hasBuildStarted,
             });
           }
 
@@ -2367,63 +2949,68 @@ Budget limit: $${HARD_BUDGET_LIMIT_USD}`;
               delayInMs: 20, // optional: defaults to 10ms
               chunking: "line", // optional: defaults to 'word'
             }),
-            // OPTIMIZED: Non-blocking stream cancellation check
-            // Use fire-and-forget pattern to avoid blocking stream processing
-            onChunk: throttle(() => {
-              // Fire-and-forget: don't await the promise
-              prisma.project
-                .findFirst({
-                  where: { id: projectId },
-                  select: { activeStreamId: true },
-                })
-                .then(async (p) => {
-                  if (!p?.activeStreamId || p.activeStreamId !== streamId) {
-                    req.logger?.info({ msg: "Stream cancelled by user" });
+            // 🔴 ABLY: Broadcast chunks in real-time (NOT throttled)
+            onChunk: (event) => {
+              // Broadcast text chunks to all project viewers immediately
+              if (event.chunk.type === "text-delta" && event.chunk.text) {
+                broadcastAIChunk(
+                  projectId,
+                  assistantMessageId || "",
+                  event.chunk.text,
+                  false,
+                  userId, // Pass userId for client-side filtering
+                ).catch(() => {});
+              } else if (
+                event.chunk.type === "reasoning-delta" &&
+                event.chunk.text
+              ) {
+                // Broadcast reasoning/thinking chunks
+                broadcastAIChunk(
+                  projectId,
+                  assistantMessageId || "",
+                  event.chunk.text,
+                  true, // isThinking
+                  userId, // Pass userId for client-side filtering
+                ).catch(() => {});
+              }
 
-                    // Mark as cancelled for credit deduction message
-                    wasCancelled = true;
-
-                    // Clear activeStreamId and timestamp when aborting
-                    await prisma.project.update({
-                      where: { id: projectId },
-                      data: {
-                        activeStreamId: null,
-                        activeStreamStartedAt: null,
-                      },
-                    });
-
-                    abortController.abort();
-                  }
-                })
-                .catch((error) => {
-                  req.logger?.error({
-                    msg: "Error checking stream status",
-                    error:
-                      error instanceof Error ? error.message : String(error),
-                  });
-                });
-            }, 2000), // Increased to 2s to reduce DB load
+              // THROTTLED: Check for stream cancellation (2s interval to reduce DB load)
+              throttledCancellationCheck();
+            },
             messages: messagesWithSystem,
             tools: chatTools,
             stopWhen: [
               stepCountIs(getMaxSteps(complexityAnalysis)),
 
               // 🛑 HITL (Human-in-the-Loop) stop condition
-              // Stop immediately when a tool returns pending_confirmation
-              // This allows the user to confirm before the AI continues
+              // Stop immediately when a tool returns a pending status
+              // This allows the user to confirm/respond before the AI continues
               ({ steps }) => {
                 if (steps.length === 0) return false;
                 const lastStep = steps[steps.length - 1];
                 if (!lastStep.toolResults) return false;
 
+                // List of HITL statuses that should stop generation
+                const hitlPendingStatuses = [
+                  "pending_confirmation", // deployToShipperCloud
+                  "pending_api_keys", // requestApiKeys
+                  "pending_user_input", // askClarifyingQuestions
+                  "pending_approval", // Stripe HITL tools
+                ];
+
                 for (const toolResult of lastStep.toolResults) {
+                  if (!toolResult) continue;
                   const output = toolResult.output as
                     | { status?: string }
                     | undefined;
-                  if (output?.status === "pending_confirmation") {
+                  if (
+                    output?.status &&
+                    hitlPendingStatuses.includes(output.status)
+                  ) {
                     req.logger?.info({
-                      msg: "HITL tool returned pending_confirmation - stopping generation",
+                      msg: "HITL tool returned pending status - stopping generation",
                       toolName: toolResult.toolName,
+                      status: output.status,
                       step: steps.length,
                     });
                     return true;
@@ -2525,16 +3112,18 @@ Budget limit: $${HARD_BUDGET_LIMIT_USD}`;
                 builderOutputTokens += usage?.outputTokens || 0;
               }
 
-              // Check if user can afford the CUMULATIVE cost so far
-              // This ensures we stop before exceeding what the user can pay
+              // Check if workspace can afford the CUMULATIVE cost so far
+              // This ensures we stop before exceeding what the workspace can pay
               // Use correct margin: 10% for first prompt, 50% for follow-ups
               const cumulativeCredits = isFirstPromptPricing
                 ? calculateCreditsFromUSDFirstPrompt(builderAnthropicCost)
                 : calculateCreditsFromUSD(builderAnthropicCost);
-              const affordability = await CreditManager.canAffordOperation(
-                userId,
-                cumulativeCredits,
-              );
+              // 🏢 WORKSPACE-CENTRIC: Check workspace credits
+              const affordability =
+                await CreditManager.canWorkspaceAffordOperation(
+                  workspaceId!,
+                  cumulativeCredits,
+                );
               if (!affordability.canAfford) {
                 req.logger?.error({
                   msg: "Insufficient credits during generation - aborting and finalizing",
@@ -2547,7 +3136,7 @@ Budget limit: $${HARD_BUDGET_LIMIT_USD}`;
                   reason: affordability.reason,
                 });
 
-                // IMPORTANT: Deduct what user can afford NOW before aborting
+                // IMPORTANT: Deduct what workspace can afford NOW before aborting
                 // onFinish may not be called when we throw, so we must finalize here
                 if (
                   builderAnthropicCost > 0 &&
@@ -2561,13 +3150,15 @@ Budget limit: $${HARD_BUDGET_LIMIT_USD}`;
                     ) / 100,
                   );
 
-                  if (maxAffordable > 0) {
+                  if (maxAffordable > 0 && workspaceId) {
                     try {
-                      await CreditManager.deductCredits(
-                        userId,
+                      // 🏢 WORKSPACE-CENTRIC: Always deduct from workspace
+                      await CreditManager.deductWorkspaceCredits(
+                        workspaceId,
                         maxAffordable,
                         "AI_GENERATION",
                         `AI Generation for "${projectName}" - ABORTED (insufficient credits after ${stepCount} steps) [charged ${maxAffordable} of ${cumulativeCredits} credits]`,
+                        userId,
                         {
                           projectId,
                           projectName,
@@ -2585,6 +3176,7 @@ Budget limit: $${HARD_BUDGET_LIMIT_USD}`;
                       req.logger?.warn({
                         msg: "Credits deducted before abort - partial charge for work completed",
                         userId,
+                        workspaceId,
                         projectId,
                         step: stepCount,
                         totalCostUSD: builderAnthropicCost,
@@ -2596,6 +3188,7 @@ Budget limit: $${HARD_BUDGET_LIMIT_USD}`;
                       req.logger?.error({
                         msg: "Failed to deduct credits before abort",
                         userId,
+                        workspaceId,
                         projectId,
                         error:
                           deductError instanceof Error
@@ -2645,6 +3238,7 @@ Budget limit: $${HARD_BUDGET_LIMIT_USD}`;
 
               if (toolCalls) {
                 for (const toolCall of toolCalls) {
+                  if (!toolCall) continue;
                   req.logger?.debug({
                     msg: "Tool start",
                     toolName: toolCall.toolName,
@@ -2666,10 +3260,21 @@ Budget limit: $${HARD_BUDGET_LIMIT_USD}`;
                     state: "call",
                     args: toolCallWithArgs.args,
                   });
+
+                  // 🔴 ABLY: Broadcast tool call to all project viewers
+                  broadcastAIToolCall(
+                    projectId,
+                    assistantMessageId || "",
+                    toolCall.toolName,
+                    toolCall.toolCallId,
+                    toolCallWithArgs.args as Record<string, unknown>,
+                    userId,
+                  ).catch(() => {});
                 }
               }
               if (toolResults) {
                 for (const toolResult of toolResults) {
+                  if (!toolResult) continue;
                   // Check if this is a generateImage tool result with cost data
                   if (
                     toolResult.toolName === "generateImage" &&
@@ -2718,6 +3323,15 @@ Budget limit: $${HARD_BUDGET_LIMIT_USD}`;
                     toolName: toolResult.toolName,
                     toolCallId: toolResult.toolCallId,
                   });
+
+                  // 🔴 ABLY: Broadcast tool result to all project viewers
+                  broadcastAIToolResult(
+                    projectId,
+                    assistantMessageId || "",
+                    toolResult.toolCallId,
+                    toolResult.output,
+                    userId,
+                  ).catch(() => {});
                 }
               }
 
@@ -2867,6 +3481,16 @@ RULES:
               return { messages: updatedMessages };
             },
             onFinish: async ({ providerMetadata, usage: finalUsage }) => {
+              // 🔴 ABLY: Flush any pending batched chunks before completing
+              flushPendingChunks(projectId, assistantMessageId || "");
+
+              // 🔴 ABLY: Broadcast AI complete to all project viewers
+              broadcastAIComplete(
+                projectId,
+                assistantMessageId || "",
+                userId,
+              ).catch(() => {});
+
               // Extract final cache performance metrics
               const finalCacheMetrics = extractCacheMetrics(providerMetadata);
 
@@ -2906,11 +3530,19 @@ RULES:
                 const description = `AI Generation for "${projectName}" (complexity analysis + ${stepCount} builder steps + tools)${statusSuffix}${marginNote}`;
 
                 try {
-                  await CreditManager.deductCredits(
-                    userId,
+                  // 🏢 WORKSPACE-CENTRIC: Always deduct from workspace
+                  if (!workspaceId) {
+                    throw new Error(
+                      "No workspace found for project - cannot deduct credits",
+                    );
+                  }
+
+                  await CreditManager.deductWorkspaceCredits(
+                    workspaceId,
                     creditsToCharge,
                     "AI_GENERATION",
                     description,
+                    userId,
                     {
                       projectId,
                       projectName,
@@ -2930,6 +3562,7 @@ RULES:
                       ? "AI generation cancelled - Credits deducted for partial work (includes complexity analysis, builder steps, and image generation)"
                       : "AI generation complete - Credits deducted (includes complexity analysis, builder steps, and image generation)",
                     model: modelToUse,
+                    workspaceId,
                     totalSteps: stepCount,
                     totalInputTokens: builderInputTokens,
                     totalOutputTokens: builderOutputTokens,
@@ -2954,6 +3587,7 @@ RULES:
                     req.logger?.warn({
                       msg: "Insufficient credits for full deduction - attempting partial deduction",
                       userId,
+                      workspaceId,
                       projectId,
                       totalCostUSD: builderAnthropicCost,
                       creditsToCharge,
@@ -2961,10 +3595,10 @@ RULES:
                     });
 
                     try {
-                      // Check what user can actually afford (respecting minimum balance)
+                      // 🏢 WORKSPACE-CENTRIC: Check what workspace can afford
                       const affordability =
-                        await CreditManager.canAffordOperation(
-                          userId,
+                        await CreditManager.canWorkspaceAffordOperation(
+                          workspaceId!,
                           creditsToCharge,
                         );
 
@@ -2983,13 +3617,14 @@ RULES:
                           ) / 100,
                         );
 
-                        if (maxAffordable > 0) {
-                          // Deduct what they can afford
-                          await CreditManager.deductCredits(
-                            userId,
+                        if (maxAffordable > 0 && workspaceId) {
+                          // 🏢 WORKSPACE-CENTRIC: Always deduct from workspace
+                          await CreditManager.deductWorkspaceCredits(
+                            workspaceId,
                             maxAffordable,
                             "AI_GENERATION",
-                            `${description} [PARTIAL - user could only afford ${maxAffordable} of ${creditsToCharge} credits]`,
+                            `${description} [PARTIAL - workspace could only afford ${maxAffordable} of ${creditsToCharge} credits]`,
+                            userId,
                             {
                               projectId,
                               projectName,
@@ -3006,6 +3641,7 @@ RULES:
                           req.logger?.warn({
                             msg: "Partial credit deduction successful",
                             userId,
+                            workspaceId,
                             projectId,
                             originalCreditsToCharge: creditsToCharge,
                             actualCreditsCharged: maxAffordable,
@@ -3014,8 +3650,9 @@ RULES:
                           });
                         } else {
                           req.logger?.error({
-                            msg: "CRITICAL: User has no credits available for partial deduction",
+                            msg: "CRITICAL: No workspace or credits available for partial deduction",
                             userId,
+                            workspaceId,
                             projectId,
                             currentBalance: affordability.currentBalance,
                             minimumBalance,
@@ -3133,11 +3770,33 @@ RULES:
             errorMessage: isError ? error.message : String(error),
             ...extra,
           });
+
+          // 🔴 ABLY: Broadcast error and streaming stop to all project viewers
+          const errorMsg = isError ? error.message : String(error);
+          broadcastAIError(
+            projectId,
+            assistantMessageId || "",
+            errorMsg,
+            userId,
+          ).catch(() => {});
+          broadcastStreamingStop(
+            projectId,
+            userId,
+            assistantMessageId ?? undefined,
+          ).catch(() => {});
+
           // Ensure we clear registry and activeStreamId on error
           void finalizeOnAbort(projectId, streamId, toolsContext);
           return error instanceof Error ? error.message : String(error);
         },
         onFinish: async ({ responseMessage }) => {
+          // 🔴 ABLY: Broadcast streaming stop to all project viewers
+          broadcastStreamingStop(
+            projectId,
+            userId,
+            assistantMessageId ?? undefined,
+          ).catch(() => {});
+
           try {
             // If aborted, the message was already saved incrementally
             // Just finalize cleanup but don't delete the message
@@ -3692,6 +4351,10 @@ router.delete(
 
       const abortedImmediately = streamId ? abortChat(streamId) : false;
       await safeClearActiveStream(projectId);
+
+      // Broadcast streaming stop to all project viewers via SSE
+      const userId = (req as any).userId || "";
+      broadcastStreamingStop(projectId, userId).catch(() => {});
 
       req.logger?.info({
         msg: "Stream cancellation signal sent",

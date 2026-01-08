@@ -247,6 +247,8 @@ export interface DeploymentResult {
   isExisting?: boolean;
   /** True if setup was interrupted and needs to be re-run (files, packages, env vars) */
   needsSetup?: boolean;
+  /** True if existing deployment needs admin API key migration (auth templates update + API key creation) */
+  needsAdminApiKey?: boolean;
   deployment?: ProvisionResult["deployment"];
 }
 
@@ -509,8 +511,11 @@ export async function executeShipperCloudDeploymentWithFiles(
   }
 
   // If existing deployment with setup already complete, skip setup steps
+  // Note: Admin API key migration happens in deployConvex tool if needed
   if (baseResult.isExisting && !baseResult.needsSetup) {
-    logger.info("Existing deployment with setup complete - skipping setup steps");
+    logger.info(
+      "Existing deployment with setup complete - skipping setup steps",
+    );
     const deploymentUrl = baseResult.deploymentUrl!;
     const siteUrl = deploymentUrl.replace(".convex.cloud", ".convex.site");
     return {
@@ -716,6 +721,50 @@ export async function executeShipperCloudDeploymentWithFiles(
     );
   }
 
+  // Create service admin user and API key for admin operations
+  // This is done after convex deploy so Better Auth endpoints are available
+  let adminApiKeyEncrypted: string | undefined;
+  let adminUserId: string | undefined;
+
+  if (convexDeploySuccess) {
+    try {
+      // Fetch existing admin credentials from database to avoid creating duplicates
+      const existingDeployment = await prisma.convexDeployment.findUnique({
+        where: { projectId },
+        select: { adminUserId: true, adminApiKeyEncrypted: true },
+      });
+
+      const existingAdmin = existingDeployment?.adminApiKeyEncrypted
+        ? {
+            userId: existingDeployment.adminUserId,
+            apiKey: decryptDeployKey(existingDeployment.adminApiKeyEncrypted),
+          }
+        : undefined;
+
+      logger.info("Creating service admin user and API key...");
+      const adminResult = await createServiceAdminAndApiKey(siteUrl, logger, existingAdmin);
+
+      if (adminResult.success && adminResult.apiKey && adminResult.userId) {
+        adminApiKeyEncrypted = encryptDeployKey(adminResult.apiKey);
+        adminUserId = adminResult.userId;
+        logger.info(
+          { userId: adminUserId },
+          "Service admin and API key created successfully",
+        );
+      } else {
+        logger.warn(
+          { error: adminResult.error },
+          "Failed to create service admin - admin operations will use mutation fallback",
+        );
+      }
+    } catch (adminError) {
+      logger.warn(
+        { error: adminError },
+        "Error creating service admin - admin operations will use mutation fallback",
+      );
+    }
+  }
+
   // Restart dev server
   try {
     logger.info("Restarting dev server...");
@@ -730,7 +779,7 @@ export async function executeShipperCloudDeploymentWithFiles(
     logger.warn({ error: restartError }, "Dev server restart warning");
   }
 
-  // Mark setup as complete in the database
+  // Mark setup as complete in the database and store admin API key
   // This ensures that if the user interrupts deployment mid-way,
   // we know to re-run the setup steps on the next attempt
   try {
@@ -739,6 +788,9 @@ export async function executeShipperCloudDeploymentWithFiles(
       data: {
         setupComplete: true,
         setupCompletedAt: new Date(),
+        // Store admin API key for admin operations (if created)
+        ...(adminApiKeyEncrypted && { adminApiKeyEncrypted }),
+        ...(adminUserId && { adminUserId }),
       },
     });
     logger.info("Setup marked as complete");
@@ -793,7 +845,18 @@ export async function executeShipperCloudDeployment(
     // and we need to re-run setup (files, packages, env vars, convex deploy)
     const needsSetup = !existingDeployment.setupComplete;
     if (needsSetup) {
-      logger.info("Existing deployment found but setup incomplete - will re-run setup");
+      logger.info(
+        "Existing deployment found but setup incomplete - will re-run setup",
+      );
+    }
+
+    // Check if admin API key is missing - if so, we need to update auth templates
+    // and create the service admin + API key for admin operations
+    const needsAdminApiKey = !existingDeployment.adminApiKeyEncrypted;
+    if (needsAdminApiKey && !needsSetup) {
+      logger.info(
+        "Existing deployment missing admin API key - will migrate to new auth templates",
+      );
     }
 
     return {
@@ -802,6 +865,7 @@ export async function executeShipperCloudDeployment(
       deploymentName: existingDeployment.convexDeploymentName,
       isExisting: true,
       needsSetup,
+      needsAdminApiKey,
     };
   }
 
@@ -1011,7 +1075,10 @@ export async function injectDeployKeyIntoSandbox(
     }
 
     // Check if sandbox is expired
-    if (sandboxInfo.sandboxExpiresAt && new Date() > sandboxInfo.sandboxExpiresAt) {
+    if (
+      sandboxInfo.sandboxExpiresAt &&
+      new Date() > sandboxInfo.sandboxExpiresAt
+    ) {
       const message = "Sandbox has expired. Please restart the sandbox first.";
       logger.warn(`Cannot inject deploy key: ${message}`);
       if (throwOnError) {
@@ -1142,7 +1209,8 @@ const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL)
       note: "The scaffolded updateTodo mutation accepts: { id: Id<'todos'>, title?: string, completed?: boolean, ... } - all fields are FLAT at the args level, not nested in an 'updates' object!",
     },
     queryExamples: {
-      title: "🚨🚨🚨 CRITICAL: Auth-Required Queries THROW if Called Without Session! 🚨🚨🚨",
+      title:
+        "🚨🚨🚨 CRITICAL: Auth-Required Queries THROW if Called Without Session! 🚨🚨🚨",
       problem:
         "Convex queries that use getAuthUser(ctx) will throw 'Unauthenticated' error if called before the user has a valid session. You MUST use the 'skip' pattern to conditionally skip queries.",
       errorYouWillSee: "Uncaught Error: Unauthenticated at getAuthUser",
@@ -1294,7 +1362,8 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
       },
       unauthenticatedRecovery: {
         title: "If you see 'Uncaught Error: Unauthenticated at getAuthUser':",
-        problem: "A Convex query using getAuthUser is being called before the user is authenticated.",
+        problem:
+          "A Convex query using getAuthUser is being called before the user is authenticated.",
         steps: [
           "1. Find the component that's calling the failing query",
           "2. Add useSession() BEFORE the useQuery call",
@@ -1302,7 +1371,8 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
           "4. Ensure the component handles isPending and !session states before rendering",
           "5. The order MUST be: useSession → useQuery with skip → isPending check → !session check → render",
         ],
-        example: "const { data: session } = useSession();\nconst data = useQuery(api.queries.myQuery, session ? {} : 'skip');",
+        example:
+          "const { data: session } = useSession();\nconst data = useQuery(api.queries.myQuery, session ? {} : 'skip');",
       },
     },
   };
@@ -1351,4 +1421,149 @@ export function hasPendingShipperCloudConfirmation(
       toolName === SHIPPER_CLOUD_TOOL_NAME && part.state === "input-available"
     );
   });
+}
+
+/**
+ * Create a service admin user and generate an API key for admin operations.
+ *
+ * This creates a special "service-admin" user that is used for server-side
+ * admin operations like removeUser, without requiring a user session.
+ *
+ * @param siteUrl - The Convex site URL (*.convex.site)
+ * @param logger - Logger instance for this project
+ * @returns Object with success status, userId, and apiKey
+ */
+async function createServiceAdminAndApiKey(
+  siteUrl: string,
+  logger: ReturnType<typeof createProjectLogger>,
+  existingAdmin?: { userId?: string | null; apiKey?: string | null },
+): Promise<{
+  success: boolean;
+  userId?: string;
+  apiKey?: string;
+  error?: string;
+}> {
+  // If admin already exists, return existing credentials
+  if (existingAdmin?.userId && existingAdmin?.apiKey) {
+    logger.info({ userId: existingAdmin.userId }, "Using existing service admin");
+    return {
+      success: true,
+      userId: existingAdmin.userId,
+      apiKey: existingAdmin.apiKey,
+    };
+  }
+
+  const serviceAdminEmail = `service-admin-${Date.now()}@shipper.internal`;
+  const serviceAdminPassword = generateBetterAuthSecret();
+
+  try {
+    // Step 1: Create the service admin user via Better Auth sign-up
+    logger.info("Creating service admin user...");
+
+    const signUpResponse = await fetch(`${siteUrl}/api/auth/sign-up/email`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: serviceAdminEmail,
+        password: serviceAdminPassword,
+        name: "Shipper Service Admin",
+      }),
+    });
+
+    if (!signUpResponse.ok) {
+      const errorData = await signUpResponse.json().catch(() => ({}));
+      const errorMessage =
+        (errorData as { message?: string }).message ||
+        `HTTP ${signUpResponse.status}`;
+      return {
+        success: false,
+        error: `Failed to create service admin: ${errorMessage}`,
+      };
+    }
+
+    const signUpResult = (await signUpResponse.json()) as {
+      user?: { id: string };
+      token?: string;
+    };
+    const userId = signUpResult.user?.id;
+
+    if (!userId) {
+      return {
+        success: false,
+        error: "Sign-up succeeded but no user ID returned",
+      };
+    }
+
+    logger.info({ userId }, "Service admin user created");
+
+    // Step 2: Sign in to get session token
+    const signInResponse = await fetch(`${siteUrl}/api/auth/sign-in/email`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: serviceAdminEmail,
+        password: serviceAdminPassword,
+      }),
+    });
+
+    let sessionToken: string | undefined;
+    if (signInResponse.ok) {
+      const setCookieHeader = signInResponse.headers.get("set-cookie");
+      if (setCookieHeader) {
+        const tokenMatch = setCookieHeader.match(
+          /better-auth\.session_token=([^;]+)/,
+        );
+        sessionToken = tokenMatch?.[1];
+      }
+    }
+
+    // Step 3: Create API key for the service admin
+    logger.info("Creating API key for service admin...");
+
+    // For server-side API key creation, always pass userId directly
+    // Don't rely on session cookies - they don't work in server-to-server calls
+    const apiKeyResponse = await fetch(`${siteUrl}/api/auth/api-key/create`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        name: "shipper-admin-key",
+        userId, // Always pass userId for server-side creation
+      }),
+    });
+
+    if (!apiKeyResponse.ok) {
+      const errorData = await apiKeyResponse.json().catch(() => ({}));
+      const errorMessage =
+        (errorData as { message?: string }).message ||
+        `HTTP ${apiKeyResponse.status}`;
+      return {
+        success: false,
+        error: `Failed to create API key: ${errorMessage}`,
+        userId,
+      };
+    }
+
+    const apiKeyResult = (await apiKeyResponse.json()) as {
+      key?: string;
+      apiKey?: string;
+    };
+    const apiKey = apiKeyResult.key || apiKeyResult.apiKey;
+
+    if (!apiKey) {
+      return {
+        success: false,
+        error: "API key creation succeeded but no key returned",
+        userId,
+      };
+    }
+
+    logger.info("API key created successfully");
+
+    return { success: true, userId, apiKey };
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    return { success: false, error: errorMsg };
+  }
 }

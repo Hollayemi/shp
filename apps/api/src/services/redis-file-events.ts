@@ -3,6 +3,8 @@
  *
  * Publishes file creation/update events to Redis for cross-process communication.
  * The webapp SSE endpoint subscribes to these events and forwards them to frontend clients.
+ *
+ * Falls back to in-memory pub/sub when Redis is not configured (single-instance mode).
  */
 
 import { Redis } from "ioredis";
@@ -17,6 +19,41 @@ export type FileCreationEvent = {
 };
 
 const REDIS_CHANNEL_PREFIX = "file-events:";
+
+// In-memory event listeners for when Redis is not available
+type FileEventListener = (event: FileCreationEvent) => void;
+const inMemoryListeners = new Map<string, Set<FileEventListener>>();
+
+/**
+ * Subscribe to file events for a project (in-memory fallback)
+ */
+export function subscribeToFileEvents(
+  projectId: string,
+  listener: FileEventListener,
+): () => void {
+  if (!inMemoryListeners.has(projectId)) {
+    inMemoryListeners.set(projectId, new Set());
+  }
+  inMemoryListeners.get(projectId)!.add(listener);
+
+  defaultLogger.debug({
+    msg: "Added in-memory file event listener",
+    service: "redis-file-events",
+    projectId,
+    listenerCount: inMemoryListeners.get(projectId)!.size,
+  });
+
+  // Return unsubscribe function
+  return () => {
+    const listeners = inMemoryListeners.get(projectId);
+    if (listeners) {
+      listeners.delete(listener);
+      if (listeners.size === 0) {
+        inMemoryListeners.delete(projectId);
+      }
+    }
+  };
+}
 
 class RedisFileStreamPublisher {
   private static instance: RedisFileStreamPublisher;
@@ -130,12 +167,41 @@ class RedisFileStreamPublisher {
       action: event.action,
     });
 
+    // Fallback to in-memory pub/sub when Redis is not available
     if (!this.redisPublisher) {
-      defaultLogger.warn({
-        msg: "Redis not available - file event not published",
+      defaultLogger.info({
+        msg: "Redis not available - using in-memory pub/sub",
         service: "redis-file-events",
         filePath: event.filePath,
+        projectId: event.projectId,
       });
+
+      // Notify in-memory listeners directly
+      const listeners = inMemoryListeners.get(event.projectId);
+      if (listeners && listeners.size > 0) {
+        for (const listener of listeners) {
+          try {
+            listener(event);
+          } catch (err) {
+            defaultLogger.error({
+              msg: "Error in in-memory file event listener",
+              service: "redis-file-events",
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+        defaultLogger.debug({
+          msg: "Delivered file event to in-memory listeners",
+          service: "redis-file-events",
+          listenerCount: listeners.size,
+        });
+      } else {
+        defaultLogger.debug({
+          msg: "No in-memory listeners for project",
+          service: "redis-file-events",
+          projectId: event.projectId,
+        });
+      }
       return;
     }
 
